@@ -593,17 +593,17 @@ DANCE_POSES = {
         }
     },
     "pump_right": {
-        "description": "Right arm pump/fist up",
+        "description": "Right fist pump upward",
         "rotations": {
-            "right_shoulder": {"raise": 60, "forward": 30},
-            "right_elbow": {"bend": 90},
+            "right_shoulder": {"raise": 80, "forward": 10},
+            "right_elbow": {"bend": 110},
         }
     },
     "pump_left": {
-        "description": "Left arm pump/fist up",
+        "description": "Left fist pump upward",
         "rotations": {
-            "left_shoulder": {"raise": 60, "forward": 30},
-            "left_elbow": {"bend": 90},
+            "left_shoulder": {"raise": 80, "forward": 10},
+            "left_elbow": {"bend": 110},
         }
     },
     "head_down": {
@@ -1043,17 +1043,18 @@ class SCAILBeatDrivenPose:
         
         # === TREBLE: Arm energy ===
         if treble_int > 0:
-            # Arms raise/spread with treble
+            # Arms raise/spread with treble - both arms together
             arm_raise = treble * treble_int * 20  # degrees
             result = self._apply_rotation(result, "right_shoulder", "raise", arm_raise)
             result = self._apply_rotation(result, "left_shoulder", "raise", arm_raise)
             
-            # Elbow bend variation - alternate arms
+            # Elbow bend variation - alternate but always keep some bend
+            # Minimum 25 degrees bend so arms never go straight
             elbow_phase = phase * 2
-            r_elbow_bend = (0.5 + 0.5 * np.sin(elbow_phase)) * treble * treble_int * 25
-            l_elbow_bend = (0.5 + 0.5 * np.sin(elbow_phase + np.pi)) * treble * treble_int * 25
-            result = self._apply_rotation(result, "right_elbow", "bend", 15 + r_elbow_bend)
-            result = self._apply_rotation(result, "left_elbow", "bend", 15 + l_elbow_bend)
+            r_elbow_bend = 25 + (0.5 + 0.5 * np.sin(elbow_phase)) * treble * treble_int * 20
+            l_elbow_bend = 25 + (0.5 + 0.5 * np.sin(elbow_phase + np.pi)) * treble * treble_int * 20
+            result = self._apply_rotation(result, "right_elbow", "bend", r_elbow_bend)
+            result = self._apply_rotation(result, "left_elbow", "bend", l_elbow_bend)
         
         # === ONSET: Head snap + accent ===
         if onset_int > 0 and onset > 0.3:
