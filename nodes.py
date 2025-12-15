@@ -717,8 +717,8 @@ MOVE_SEQUENCES = {
         ["lean_left", "lean_right", "lean_left", "lean_right"],
         ["hip_left", "hip_right", "hip_left", "hip_right"],
         ["look_left", "head_down", "look_right", "head_down"],
-        # Subtle stepping
-        ["step_left", "step_right", "step_left", "step_right"],
+        # Subtle stepping - with grounded poses between
+        ["step_left", "neutral", "step_right", "neutral"],
         ["lean_left", "step_left", "lean_right", "step_right"],
     ],
     "medium": [
@@ -729,10 +729,10 @@ MOVE_SEQUENCES = {
         # Body flows
         ["lean_left", "crouch", "lean_right", "crouch"],
         ["crouch", "arms_out", "crouch", "arms_up"],
-        # Stepping flows
-        ["step_left", "step_right", "step_left", "step_right"],
+        # Stepping flows - GROUNDED between leg lifts
+        ["step_left", "crouch", "step_right", "crouch"],
         ["step_left", "pump_left", "step_right", "pump_right"],
-        ["march_left", "march_right", "march_left", "march_right"],
+        ["march_left", "crouch", "march_right", "crouch"],
         # Combined
         ["lean_left", "pump_right", "lean_right", "pump_left"],
         ["hip_left", "arms_up", "hip_right", "arms_out"],
@@ -742,14 +742,14 @@ MOVE_SEQUENCES = {
         ["arms_up", "crouch", "arms_up", "crouch"],
         ["pump_right", "arms_up", "pump_left", "arms_up"],
         ["arms_out", "arms_up", "arms_out", "crouch"],
-        # Kicks and marches
-        ["kick_right", "kick_left", "kick_right", "kick_left"],
+        # Kicks and marches - GROUNDED between
+        ["kick_right", "crouch", "kick_left", "crouch"],
         ["march_left", "arms_up", "march_right", "arms_up"],
         ["kick_right", "arms_up", "kick_left", "arms_up"],
         # Full body flows
         ["crouch", "arms_up", "lean_left", "arms_out", "lean_right", "crouch"],
-        ["step_left", "arms_up", "step_right", "crouch", "step_left", "arms_out"],
-        ["march_left", "pump_left", "march_right", "pump_right"],
+        ["step_left", "arms_up", "crouch", "step_right", "arms_out", "crouch"],
+        ["march_left", "pump_left", "crouch", "march_right", "pump_right", "crouch"],
         # Explosive
         ["crouch", "arms_up", "crouch", "kick_right", "crouch", "kick_left"],
         ["head_back", "arms_up", "crouch", "arms_up"],
@@ -806,6 +806,181 @@ AUDIO_FEATURE_MAPPING = {
 }
 
 
+# ============================================================================
+# MOTION DYNAMICS SYSTEM
+# ============================================================================
+# Proper animation principles: momentum, follow-through, overlapping action
+
+class MotionDynamics:
+    """
+    Physics-inspired motion system for fluid animation.
+    
+    Instead of linear interpolation between keyframes, this system:
+    1. Tracks velocity per joint
+    2. Applies momentum and drag
+    3. Uses different timing for different body parts (overlapping action)
+    4. Adds follow-through after reaching targets
+    """
+    
+    # Body part groupings for overlapping action
+    # Lower numbers = leads the motion, higher = follows/drags
+    BODY_PART_PRIORITY = {
+        # Core leads
+        1: [1],  # neck/spine - initiates
+        8: [8], 11: [11],  # hips - power center
+        
+        # Mid-chain follows
+        2: [2], 5: [5],  # shoulders
+        9: [9], 12: [12],  # knees
+        
+        # Extremities drag behind
+        0: [0, 14, 15, 16, 17],  # head/face
+        3: [3], 6: [6],  # elbows
+        10: [10], 13: [13],  # ankles
+        4: [4], 7: [7],  # wrists (most drag)
+    }
+    
+    # Drag factors per joint (0 = instant, higher = more follow-through)
+    # These are MUCH lower now for snappier response
+    JOINT_DRAG = {
+        0: 0.15,  # nose
+        1: 0.02,  # neck - leads, very responsive
+        2: 0.08,  # r_shoulder
+        3: 0.12,  # r_elbow
+        4: 0.18,  # r_wrist - most follow-through
+        5: 0.08,  # l_shoulder
+        6: 0.12,  # l_elbow
+        7: 0.18,  # l_wrist
+        8: 0.03,  # r_hip - core, very responsive
+        9: 0.10,  # r_knee
+        10: 0.06, # r_ankle
+        11: 0.03, # l_hip
+        12: 0.10, # l_knee
+        13: 0.06, # l_ankle
+        14: 0.15, # r_eye
+        15: 0.15, # l_eye
+        16: 0.20, # r_ear
+        17: 0.20, # l_ear
+    }
+    
+    # Stiffness - how quickly joints try to reach target (spring constant)
+    # Higher = snappier, more responsive
+    JOINT_STIFFNESS = {
+        0: 15.0,  # nose
+        1: 25.0,  # neck - very snappy
+        2: 20.0,  # shoulders
+        3: 15.0,  # elbows
+        4: 12.0,  # wrists
+        5: 20.0,
+        6: 15.0,
+        7: 12.0,
+        8: 30.0,  # hips - very strong
+        9: 22.0,  # knees
+        10: 18.0, # ankles
+        11: 30.0,
+        12: 22.0,
+        13: 18.0,
+        14: 12.0, # eyes
+        15: 12.0,
+        16: 10.0, # ears
+        17: 10.0,
+    }
+    
+    def __init__(self, num_joints=18):
+        self.num_joints = num_joints
+        self.velocities = np.zeros((num_joints, 3))
+        self.positions = None
+        self.dt = 1.0 / 24.0  # Will be set per frame
+        
+    def set_fps(self, fps):
+        self.dt = 1.0 / fps
+        
+    def initialize(self, start_pose):
+        """Initialize with starting pose."""
+        self.positions = start_pose.copy()
+        self.velocities = np.zeros((self.num_joints, 3))
+    
+    def step_towards(self, target_pose, urgency=1.0):
+        """
+        Step the motion system towards a target pose.
+        
+        Args:
+            target_pose: (18, 3) target joint positions
+            urgency: 0-2, how quickly to move (1 = normal, 2 = snappy, 0.5 = lazy)
+        
+        Returns:
+            Current pose after physics step
+        """
+        if self.positions is None:
+            self.positions = target_pose.copy()
+            return self.positions.copy()
+        
+        result = np.zeros_like(self.positions)
+        
+        for j in range(self.num_joints):
+            drag = self.JOINT_DRAG.get(j, 0.1)
+            stiffness = self.JOINT_STIFFNESS.get(j, 15.0) * urgency
+            
+            # Spring force towards target
+            displacement = target_pose[j] - self.positions[j]
+            spring_force = displacement * stiffness
+            
+            # Damping - UNDER-damped for liveliness (allows overshoot)
+            # Factor of 1.2 instead of 2.0 (critical) means some bounce
+            damping = 1.2 * np.sqrt(stiffness)
+            damping_force = -self.velocities[j] * damping
+            
+            # Total acceleration
+            acceleration = spring_force + damping_force
+            
+            # Integrate velocity
+            self.velocities[j] += acceleration * self.dt
+            
+            # Apply drag to velocity (separate from spring damping)
+            self.velocities[j] *= (1.0 - drag)
+            self.velocities[j] *= (1.0 - drag * 0.5)
+            
+            # Integrate position
+            self.positions[j] += self.velocities[j] * self.dt
+            
+            result[j] = self.positions[j]
+        
+        return result
+    
+    def add_impulse(self, joint_indices, impulse_vector):
+        """Add an instantaneous velocity impulse to joints."""
+        for j in joint_indices:
+            if j < self.num_joints:
+                self.velocities[j] += impulse_vector
+    
+    def get_velocity_magnitude(self):
+        """Get overall motion intensity."""
+        return np.mean(np.linalg.norm(self.velocities, axis=1))
+
+
+def ease_in_out_cubic(t):
+    """Smooth ease-in-out curve."""
+    if t < 0.5:
+        return 4 * t * t * t
+    else:
+        return 1 - pow(-2 * t + 2, 3) / 2
+
+
+def ease_out_back(t, overshoot=0.3):
+    """Ease out with slight overshoot (anticipation/follow-through)."""
+    c1 = 1.70158 * overshoot
+    c3 = c1 + 1
+    return 1 + c3 * pow(t - 1, 3) + c1 * pow(t - 1, 2)
+
+
+def ease_out_elastic(t, intensity=0.3):
+    """Elastic ease out - for snappy motions with bounce."""
+    if t == 0 or t == 1:
+        return t
+    p = 0.3
+    return pow(2, -10 * t) * np.sin((t - p / 4) * (2 * np.pi) / p) * intensity + 1
+
+
 class SCAILBeatDrivenPose:
     """
     Beat-driven keyframe dance system with proper joint rotation and audio modulation.
@@ -813,8 +988,8 @@ class SCAILBeatDrivenPose:
     This system:
     1. Detects beats from audio
     2. Selects poses from a library on each beat
-    3. Applies poses using proper joint rotation (hierarchical)
-    4. Smoothly interpolates between keyframe poses
+    3. Uses physics-based motion dynamics (momentum, follow-through, drag)
+    4. Overlapping action - different body parts move at different rates
     5. Overlays continuous audio-driven modulation (bass→bounce, treble→arms, etc.)
     """
     
@@ -832,11 +1007,11 @@ class SCAILBeatDrivenPose:
                 "pose_intensity": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 3.0, "step": 0.1,
                     "tooltip": "Scale keyframe pose rotations"}),
                 
-                # Timing
-                "anticipation_frames": ("INT", {"default": 3, "min": 0, "max": 10,
-                    "tooltip": "Frames to start moving BEFORE the beat"}),
-                "hold_frames": ("INT", {"default": 2, "min": 0, "max": 10,
-                    "tooltip": "Frames to hold pose ON the beat"}),
+                # Motion dynamics
+                "motion_smoothness": ("FLOAT", {"default": 1.0, "min": 0.3, "max": 2.0, "step": 0.1,
+                    "tooltip": "How smooth/fluid the motion is (higher = more follow-through)"}),
+                "motion_snap": ("FLOAT", {"default": 1.0, "min": 0.5, "max": 2.0, "step": 0.1,
+                    "tooltip": "How snappy motion is on beats (higher = sharper hits)"}),
                 
                 # Audio-driven modulation intensities
                 "bass_intensity": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 3.0, "step": 0.1,
@@ -980,115 +1155,58 @@ class SCAILBeatDrivenPose:
                                  bass: float, mid: float, treble: float, onset: float,
                                  bass_int: float, mid_int: float, treble_int: float, 
                                  onset_int: float, time_sec: float, tempo: float) -> np.ndarray:
-        """Apply continuous audio-driven modulation as an overlay."""
+        """Apply continuous audio-driven modulation as an overlay.
+        
+        This is additive motion on top of the keyframe poses - subtle, continuous,
+        and reactive to audio without fighting the base motion.
+        """
         result = joints.copy()
         
         beat_period = 60.0 / tempo
         phase = (time_sec / beat_period) * 2 * np.pi
         
-        # Store original ankle positions to keep feet grounded
-        r_ankle_orig = base_joints[10].copy()
-        l_ankle_orig = base_joints[13].copy()
-        
-        # === BASS: Bounce + alternating knee bend ===
+        # === BASS: Subtle bounce and knee pulse ===
         if bass_int > 0:
-            # Knee bend overlay - ALTERNATE legs so one is always more planted
-            knee_bend = bass * bass_int * 20  # degrees
+            # Gentle vertical pulse - affects whole body uniformly
+            bounce = bass * bass_int * 8.0 * np.sin(phase * 2)
+            result[:, 1] += bounce
             
-            # Use phase to alternate which leg bends more
-            right_weight = 0.5 + 0.4 * np.sin(phase)  # 0.1 to 0.9
-            left_weight = 0.5 - 0.4 * np.sin(phase)   # 0.9 to 0.1
-            
-            result = self._apply_rotation(result, "right_knee", "bend", knee_bend * right_weight)
-            result = self._apply_rotation(result, "left_knee", "bend", knee_bend * left_weight)
-            
-            # Hip forward follows knee bend
-            result = self._apply_rotation(result, "right_hip", "forward", knee_bend * right_weight * 0.3)
-            result = self._apply_rotation(result, "left_hip", "forward", knee_bend * left_weight * 0.3)
-            
-            # Slight forward lean with bass
-            result = self._apply_rotation(result, "spine", "forward", bass * bass_int * 5)
-            
-            # Vertical bounce - move upper body down, but keep ankles planted
-            bounce = bass * bass_int * 12.0
-            # Only apply bounce to upper body joints (not ankles)
-            upper_body = [0, 1, 2, 3, 4, 5, 6, 7, 14, 15, 16, 17]  # head, torso, arms
-            for j in upper_body:
-                result[j, 1] += bounce
-            # Hips and knees get partial bounce
-            for j in [8, 9, 11, 12]:
-                result[j, 1] += bounce * 0.5
+            # Subtle knee bend pulse
+            knee_pulse = bass * bass_int * 10
+            result = self._apply_rotation(result, "right_knee", "bend", knee_pulse)
+            result = self._apply_rotation(result, "left_knee", "bend", knee_pulse)
         
-        # === MID: Sway + hip motion ===
+        # === MID: Sway ===
         if mid_int > 0:
-            # Horizontal sway - smooth oscillation modulated by mid
-            sway_amount = np.sin(phase) * (0.3 + mid * 0.7) * mid_int * 10.0
-            # Apply sway to upper body more than lower
-            for j in [0, 1, 2, 3, 4, 5, 6, 7, 14, 15, 16, 17]:
-                result[j, 0] += sway_amount
-            for j in [8, 9, 11, 12]:
-                result[j, 0] += sway_amount * 0.4
-            # Ankles stay mostly put
-            for j in [10, 13]:
-                result[j, 0] += sway_amount * 0.1
+            # Smooth horizontal sway
+            sway = np.sin(phase) * mid * mid_int * 8.0
+            result[:, 0] += sway
             
-            # Hip tilt - weight shift
-            hip_tilt = np.sin(phase * 0.5) * mid * mid_int * 6
-            result = self._apply_rotation(result, "right_hip", "raise", hip_tilt)
-            result = self._apply_rotation(result, "left_hip", "raise", -hip_tilt)
-            
-            # Spine tilt with sway
+            # Subtle spine follow
             result = self._apply_rotation(result, "spine", "tilt", 
-                                          np.sin(phase) * mid * mid_int * 4)
+                                          np.sin(phase) * mid * mid_int * 3)
         
         # === TREBLE: Arm energy ===
         if treble_int > 0:
-            # Arms raise/spread with treble - both arms together
-            arm_raise = treble * treble_int * 20  # degrees
-            result = self._apply_rotation(result, "right_shoulder", "raise", arm_raise)
-            result = self._apply_rotation(result, "left_shoulder", "raise", arm_raise)
+            # Arms lift slightly with treble
+            arm_lift = treble * treble_int * 12
+            result = self._apply_rotation(result, "right_shoulder", "raise", arm_lift)
+            result = self._apply_rotation(result, "left_shoulder", "raise", arm_lift)
             
-            # Elbow bend variation - alternate but always keep some bend
-            # Minimum 25 degrees bend so arms never go straight
-            elbow_phase = phase * 2
-            r_elbow_bend = 25 + (0.5 + 0.5 * np.sin(elbow_phase)) * treble * treble_int * 20
-            l_elbow_bend = 25 + (0.5 + 0.5 * np.sin(elbow_phase + np.pi)) * treble * treble_int * 20
-            result = self._apply_rotation(result, "right_elbow", "bend", r_elbow_bend)
-            result = self._apply_rotation(result, "left_elbow", "bend", l_elbow_bend)
+            # Elbow variation
+            elbow_var = 20 + np.sin(phase * 2) * treble * treble_int * 10
+            result = self._apply_rotation(result, "right_elbow", "bend", elbow_var)
+            result = self._apply_rotation(result, "left_elbow", "bend", elbow_var)
         
-        # === ONSET: Head snap + accent ===
-        if onset_int > 0 and onset > 0.3:
-            # Sharp head nod on transients
-            head_snap = onset * onset_int * 15
+        # === ONSET: Head accent ===
+        if onset_int > 0 and onset > 0.4:
+            head_snap = onset * onset_int * 12
             result = self._apply_rotation(result, "head", "nod", head_snap)
-        
-        # === GROUND CONSTRAINT: Prevent BOTH feet from lifting simultaneously ===
-        # One foot can lift (stepping), but not both (floating)
-        r_ankle_delta_y = result[10, 1] - r_ankle_orig[1]
-        l_ankle_delta_y = result[13, 1] - l_ankle_orig[1]
-        
-        # Negative delta = foot lifted up
-        r_lifted = r_ankle_delta_y < -5
-        l_lifted = l_ankle_delta_y < -5
-        
-        # If BOTH feet are lifting, push the lower one back down
-        if r_lifted and l_lifted:
-            # Whichever lifted less stays down
-            if r_ankle_delta_y > l_ankle_delta_y:
-                # Right foot lifted less, plant it
-                correction = r_ankle_delta_y + 2
-                result[10, 1] -= correction
-                result[9, 1] -= correction * 0.3
-            else:
-                # Left foot lifted less, plant it
-                correction = l_ankle_delta_y + 2
-                result[13, 1] -= correction
-                result[12, 1] -= correction * 0.3
         
         return result
     
     def generate(self, base_pose, beat_info, audio_features, energy_style, pose_intensity,
-                 anticipation_frames, hold_frames, bass_intensity, mid_intensity,
+                 motion_smoothness, motion_snap, bass_intensity, mid_intensity,
                  treble_intensity, onset_intensity, pose_variation, seed):
         
         rng = np.random.default_rng(seed)
@@ -1119,19 +1237,32 @@ class SCAILBeatDrivenPose:
                               np.linspace(0, 1, len(onsets)), onsets)
         
         print(f"[SCAIL-BeatDriven] Generating {frame_count} frames with {len(beat_frames)} beats")
-        print(f"[SCAIL-BeatDriven] Tempo: {tempo:.1f} BPM, Audio modulation enabled")
+        print(f"[SCAIL-BeatDriven] Tempo: {tempo:.1f} BPM, Motion dynamics enabled")
+        print(f"[SCAIL-BeatDriven] Smoothness: {motion_smoothness}, Snap: {motion_snap}")
+        
+        # Leg-lift poses that need timing constraints
+        LEG_LIFT_POSES = {"step_left", "step_right", "kick_left", "kick_right", "march_left", "march_right"}
+        GROUNDED_POSES = {"neutral", "crouch", "lean_left", "lean_right", "hip_left", "hip_right", 
+                         "arms_up", "arms_out", "pump_left", "pump_right", "arms_crossed_low",
+                         "head_down", "head_back", "look_left", "look_right"}
+        
+        # Timing constraints (in frames)
+        min_leg_lift_frames = max(3, int(fps * 0.15))  # At least 150ms or 3 frames
+        max_leg_lift_frames = int(fps * 0.6)  # Max 600ms (about half a second)
         
         # Build keyframe schedule
         keyframes = []
         current_sequence = []
         sequence_idx = 0
         last_pose = "neutral"
+        leg_lift_start_frame = None  # Track when leg lift started
         
         for i, beat_frame in enumerate(beat_frames):
             is_downbeat = beat_frame in downbeat_frames
+            beat_frame = int(beat_frame)
             
             if energy_style == "auto":
-                energy_level = self._determine_energy_level(energy, int(beat_frame))
+                energy_level = self._determine_energy_level(energy, beat_frame)
             else:
                 energy_level = energy_style
             
@@ -1143,19 +1274,51 @@ class SCAILBeatDrivenPose:
             pose_name = current_sequence[sequence_idx]
             sequence_idx += 1
             
+            # === LEG TIMING CONSTRAINTS ===
+            
+            # Check if we're currently in a leg lift
+            if leg_lift_start_frame is not None:
+                frames_in_lift = beat_frame - leg_lift_start_frame
+                
+                # If we've been lifting too long, force a grounded pose
+                if frames_in_lift >= max_leg_lift_frames:
+                    if pose_name in LEG_LIFT_POSES:
+                        # Pick a grounded pose instead
+                        pose_name = "crouch" if rng.random() < 0.5 else "neutral"
+                    leg_lift_start_frame = None
+                    
+            # Check if this is a new leg lift
+            if pose_name in LEG_LIFT_POSES:
+                if leg_lift_start_frame is None:
+                    # Starting a new leg lift
+                    leg_lift_start_frame = beat_frame
+                    
+                    # Check if next beat is too soon (leg won't register)
+                    if i + 1 < len(beat_frames):
+                        next_beat = int(beat_frames[i + 1])
+                        if next_beat - beat_frame < min_leg_lift_frames:
+                            # Too short - skip this leg lift, do something grounded
+                            pose_name = last_pose if last_pose in GROUNDED_POSES else "crouch"
+                            leg_lift_start_frame = None
+            else:
+                # Not a leg lift pose - reset tracker
+                leg_lift_start_frame = None
+            
             # On downbeats, maybe add emphasis without breaking flow
             if is_downbeat and rng.random() < 0.3:
                 # Pick emphasis moves that work as transitions
                 if last_pose in ["lean_left", "lean_right", "hip_left", "hip_right"]:
-                    pose_name = "crouch"  # Ground the sway with a drop
+                    pose_name = "crouch"
+                    leg_lift_start_frame = None
                 elif last_pose in ["pump_right", "pump_left"]:
-                    pose_name = "arms_up"  # Escalate the arm motion
-                elif last_pose in ["step_left", "step_right", "march_left", "march_right"]:
-                    pose_name = "crouch"  # Drop after stepping
+                    pose_name = "arms_up"
+                elif last_pose in LEG_LIFT_POSES:
+                    pose_name = "crouch"  # Ground after leg lift
+                    leg_lift_start_frame = None
                 elif last_pose == "crouch":
-                    pose_name = "arms_up"  # Pop up from crouch
+                    pose_name = "arms_up"
             
-            keyframes.append((int(beat_frame), pose_name, is_downbeat))
+            keyframes.append((beat_frame, pose_name, is_downbeat))
             last_pose = pose_name
         
         # Only add neutral at very start if needed (let it start moving immediately)
@@ -1165,10 +1328,10 @@ class SCAILBeatDrivenPose:
             # Long gap at start - ease in from neutral
             keyframes.insert(0, (0, "neutral", False))
         
-        # End: return to a rest pose (not necessarily neutral)
+        # End: return to a grounded pose
         if len(keyframes) > 0 and keyframes[-1][0] < frame_count - 10:
-            # Ease out to something relaxed
-            final_pose = "neutral" if last_pose in ["arms_up", "kick_right", "kick_left"] else last_pose
+            # Ease out to something grounded
+            final_pose = "neutral" if last_pose in LEG_LIFT_POSES or last_pose == "arms_up" else last_pose
             keyframes.append((frame_count - 1, final_pose, False))
         
         print(f"[SCAIL-BeatDriven] Created {len(keyframes)} keyframes")
@@ -1181,50 +1344,89 @@ class SCAILBeatDrivenPose:
                     base_joints, pose_name, pose_intensity
                 )
         
-        # Generate pose for each frame
+        # Initialize motion dynamics system
+        motion = MotionDynamics(num_joints=18)
+        motion.set_fps(fps)
+        motion.initialize(base_joints.copy())
+        
+        # Apply smoothness parameter - subtle scaling, not extreme
+        # smoothness > 1 = slightly more follow-through
+        # smoothness < 1 = slightly snappier
+        drag_scale = 0.7 + 0.3 * motion_smoothness  # 0.7 to 1.3 range
+        stiffness_scale = 1.3 - 0.3 * motion_smoothness  # 1.0 to 0.7 range (inverted)
+        
+        for j in range(18):
+            base_drag = MotionDynamics.JOINT_DRAG.get(j, 0.1)
+            base_stiff = MotionDynamics.JOINT_STIFFNESS.get(j, 15.0)
+            motion.JOINT_DRAG[j] = base_drag * drag_scale
+            motion.JOINT_STIFFNESS[j] = base_stiff * stiffness_scale
+        
+        # Generate pose for each frame using physics simulation
         pose_sequence = []
         
         for frame_idx in range(frame_count):
-            # Find surrounding keyframes
-            prev_kf = None
+            # Find current target keyframe
+            target_kf = None
             next_kf = None
             
             for kf_frame, kf_pose, kf_downbeat in keyframes:
                 if kf_frame <= frame_idx:
-                    prev_kf = (kf_frame, kf_pose, kf_downbeat)
-                if kf_frame >= frame_idx and next_kf is None:
+                    target_kf = (kf_frame, kf_pose, kf_downbeat)
+                if kf_frame > frame_idx and next_kf is None:
                     next_kf = (kf_frame, kf_pose, kf_downbeat)
                     break
             
-            if prev_kf is None:
-                prev_kf = keyframes[0]
-            if next_kf is None:
-                next_kf = keyframes[-1]
+            if target_kf is None:
+                target_kf = keyframes[0]
             
-            prev_frame, _, _ = prev_kf
-            next_frame, _, _ = next_kf
+            target_frame, target_pose_name, is_downbeat = target_kf
+            target_joints = keyframe_poses.get(target_frame, base_joints)
             
-            prev_joints = keyframe_poses.get(prev_frame, base_joints)
-            next_joints = keyframe_poses.get(next_frame, base_joints)
+            # Leg lift poses - don't anticipate into these
+            LEG_LIFT_POSES = {"step_left", "step_right", "kick_left", "kick_right", "march_left", "march_right"}
             
-            # Interpolation with anticipation
-            if prev_frame == next_frame:
-                t = 0.0
-            else:
-                adjusted_frame = frame_idx + anticipation_frames
-                span = next_frame - prev_frame
-                t = (adjusted_frame - prev_frame) / span
-                t = np.clip(t, 0.0, 1.0)
+            # Calculate urgency based on proximity to next beat
+            # More urgent = snappier motion as we approach the beat
+            if next_kf is not None:
+                next_frame = next_kf[0]
+                next_pose_name = next_kf[1]
+                frames_to_next = next_frame - frame_idx
+                frames_since_last = frame_idx - target_frame
+                total_span = next_frame - target_frame
                 
-                if hold_frames > 0:
-                    hold_start = 1.0 - (hold_frames / span) if span > hold_frames else 0.8
-                    if t > hold_start:
-                        t = 1.0
+                if total_span > 0:
+                    progress = frames_since_last / total_span
+                    
+                    # Anticipation: start moving toward next pose early
+                    # BUT NOT if next pose is a leg lift (would cause both legs up)
+                    # AND NOT if current pose is a leg lift (need to complete it first)
+                    can_anticipate = (next_pose_name not in LEG_LIFT_POSES and 
+                                     target_pose_name not in LEG_LIFT_POSES)
+                    
+                    if progress > 0.7 and can_anticipate:
+                        # Blend target toward next pose
+                        next_joints = keyframe_poses.get(next_kf[0], base_joints)
+                        blend = (progress - 0.7) / 0.3  # 0 to 1 over last 30%
+                        blend = ease_in_out_cubic(blend) * 0.4  # Max 40% blend
+                        target_joints = target_joints * (1 - blend) + next_joints * blend
+                    
+                    # Urgency peaks mid-transition, lower at endpoints
+                    base_urgency = 0.7 / motion_smoothness
+                    urgency_variation = 0.5 * motion_snap
+                    urgency = base_urgency + urgency_variation * np.sin(progress * np.pi)
+                else:
+                    urgency = 1.0 * motion_snap
+            else:
+                urgency = 0.7 / motion_smoothness  # Relaxed at end
             
-            # Interpolate between keyframes
-            joints = self._interpolate_poses(prev_joints, next_joints, t)
+            # Downbeats get extra snap
+            if is_downbeat and frame_idx == target_frame:
+                urgency *= 1.2 * motion_snap
             
-            # Apply audio-driven modulation overlay
+            # Step physics simulation toward target
+            joints = motion.step_towards(target_joints, urgency)
+            
+            # Apply audio-driven modulation as subtle overlay
             time_sec = frame_idx / fps
             joints = self._apply_audio_modulation(
                 joints, base_joints,
@@ -1232,6 +1434,11 @@ class SCAILBeatDrivenPose:
                 bass_intensity, mid_intensity, treble_intensity, onset_intensity,
                 time_sec, tempo
             )
+            
+            # Add impulse on strong onsets for extra pop
+            if onsets[frame_idx] > 0.6 and onset_intensity > 0:
+                # Small upward impulse to head on hits
+                motion.add_impulse([0, 14, 15], np.array([0, -2 * onset_intensity, 0]))
             
             pose_sequence.append(joints.copy())
         
