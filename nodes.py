@@ -46,7 +46,7 @@ class SCAILAudioFeatureExtractor:
             "required": {
                 "audio": ("AUDIO",),
                 "frame_count": ("INT", {"default": 81, "min": 1, "max": 10000}),
-                "fps": ("FLOAT", {"default": 24.0, "min": 1.0, "max": 120.0}),
+                "fps": ("INT", {"default": 24, "min": 1, "max": 120}),
                 "bass_range": ("STRING", {"default": "20-250"}),
                 "mid_range": ("STRING", {"default": "250-2000"}),
                 "treble_range": ("STRING", {"default": "2000-8000"}),
@@ -236,7 +236,7 @@ class SCAILBeatDetector:
             "required": {
                 "audio": ("AUDIO",),
                 "frame_count": ("INT", {"default": 81}),
-                "fps": ("FLOAT", {"default": 24.0}),
+                "fps": ("INT", {"default": 24}),
             }
         }
     
@@ -513,11 +513,11 @@ class MotionDynamics:
             base_idx = j % 18
             
             drag = self.JOINT_DRAG.get(base_idx, 0.1)
-            stiffness = 60.0 * urgency 
+            stiffness = 20.0 * urgency 
             
             # Sticky feet
             if base_idx in [10, 13]:
-                stiffness = 120.0 * urgency 
+                stiffness = 60.0 * urgency 
                 drag = 0.0 
             
             displacement = target_pose[j] - self.positions[j]
@@ -616,12 +616,20 @@ class SCAILBeatDrivenPose:
         l_stance_z = l_leg_vec[2] * 0.2
         
         r_y = np.sqrt(max(0, r_len**2 - r_stance_x**2 - r_stance_z**2))
-        neutral[10] = r_hip + np.array([r_stance_x, r_y, r_stance_z]) # Ankle
-        neutral[9] = (r_hip + neutral[10]) / 2.0 
-        
+        neutral[10] = r_hip + np.array([r_stance_x, r_y, r_stance_z])
+        # Place knee along the hip-to-ankle line, not just midpoint
+        r_dir = neutral[10] - r_hip
+        r_dir_norm = r_dir / (np.linalg.norm(r_dir) + 1e-8)
+        r_thigh_len = np.linalg.norm(char_pose[9] - char_pose[8])
+        neutral[9] = r_hip + r_dir_norm * r_thigh_len
+
         l_y = np.sqrt(max(0, l_len**2 - l_stance_x**2 - l_stance_z**2))
-        neutral[13] = l_hip + np.array([l_stance_x, l_y, l_stance_z]) # Ankle
-        neutral[12] = (l_hip + neutral[13]) / 2.0 
+        neutral[13] = l_hip + np.array([l_stance_x, l_y, l_stance_z])
+        # Place knee along the hip-to-ankle line, not just midpoint
+        l_dir = neutral[13] - l_hip
+        l_dir_norm = l_dir / (np.linalg.norm(l_dir) + 1e-8)
+        l_thigh_len = np.linalg.norm(char_pose[12] - char_pose[11])
+        neutral[12] = l_hip + l_dir_norm * l_thigh_len
         
         return neutral
 
