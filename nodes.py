@@ -44,13 +44,13 @@ class SCAILAudioFeatureExtractor:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "audio": ("AUDIO",),
-                "frame_count": ("INT", {"default": 81, "min": 1, "max": 10000}),
-                "fps": ("INT", {"default": 24, "min": 1, "max": 120}),
-                "bass_range": ("STRING", {"default": "20-250"}),
-                "mid_range": ("STRING", {"default": "250-2000"}),
-                "treble_range": ("STRING", {"default": "2000-8000"}),
-                "smoothing": ("FLOAT", {"default": 0.3, "min": 0.0, "max": 1.0}),
+                "audio": ("AUDIO", {"tooltip": "Audio input from LoadAudio or other audio node"}),
+                "frame_count": ("INT", {"default": 81, "min": 1, "max": 10000, "tooltip": "Number of output frames. Should match your video length."}),
+                "fps": ("INT", {"default": 24, "min": 1, "max": 120, "tooltip": "Frames per second. Match your target video FPS."}),
+                "bass_range": ("STRING", {"default": "20-250", "tooltip": "Bass frequency range in Hz (low-high). Drives body motion."}),
+                "mid_range": ("STRING", {"default": "250-2000", "tooltip": "Mid frequency range in Hz. Vocals/melody typically here."}),
+                "treble_range": ("STRING", {"default": "2000-8000", "tooltip": "Treble frequency range in Hz. Hi-hats, cymbals, detail."}),
+                "smoothing": ("FLOAT", {"default": 0.3, "min": 0.0, "max": 1.0, "tooltip": "Temporal smoothing. Higher = less jittery but less reactive."}),
             }
         }
     
@@ -141,15 +141,15 @@ class SCAILBasePoseGenerator:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "pose_type": (["active_idle", "t_pose", "a_pose", "custom"], {"default": "active_idle"}),
-                "character_count": ("INT", {"default": 1, "min": 1, "max": 5}),
-                "spacing": ("FLOAT", {"default": 150.0, "min": 50.0, "max": 500.0}),
-                "height": ("FLOAT", {"default": 400.0}),
-                "depth": ("FLOAT", {"default": 800.0}),
-                "center_x": ("FLOAT", {"default": 0.0}),
-                "center_y": ("FLOAT", {"default": 0.0}),
+                "pose_type": (["active_idle", "t_pose", "a_pose", "custom"], {"default": "active_idle", "tooltip": "Starting pose style. active_idle=relaxed dance-ready"}),
+                "character_count": ("INT", {"default": 1, "min": 1, "max": 5, "tooltip": "Number of characters to generate"}),
+                "spacing": ("FLOAT", {"default": 150.0, "min": 50.0, "max": 500.0, "tooltip": "Horizontal distance between characters"}),
+                "height": ("FLOAT", {"default": 400.0, "tooltip": "Character height scaling. 400 is standard."}),
+                "depth": ("FLOAT", {"default": 800.0, "tooltip": "Z-depth from camera. Higher = further away."}),
+                "center_x": ("FLOAT", {"default": 0.0, "tooltip": "Horizontal offset from frame center"}),
+                "center_y": ("FLOAT", {"default": 0.0, "tooltip": "Vertical offset from frame center"}),
             },
-            "optional": {"custom_pose": ("SCAIL_POSE",)}
+            "optional": {"custom_pose": ("SCAIL_POSE", {"tooltip": "Override with custom pose when pose_type='custom'"})}
         }
     
     RETURN_TYPES = ("SCAIL_POSE",)
@@ -234,9 +234,9 @@ class SCAILBeatDetector:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "audio": ("AUDIO",),
-                "frame_count": ("INT", {"default": 81}),
-                "fps": ("INT", {"default": 24}),
+                "audio": ("AUDIO", {"tooltip": "Audio input for beat analysis"}),
+                "frame_count": ("INT", {"default": 81, "min": 1, "max": 10000, "tooltip": "Number of frames. Should match your video length."}),
+                "fps": ("INT", {"default": 24, "min": 1, "max": 120, "tooltip": "Frames per second. Match your target video FPS."}),
             }
         }
     
@@ -300,6 +300,55 @@ def apply_chain_rotation(joints, pivot_idx, chain, axis, angle):
         if idx != pivot_idx:
             res[idx] = rotate_point(joints[idx], pivot, axis, angle)
     return res
+
+# ============================================================================
+# EASING FUNCTIONS
+# ============================================================================
+
+def ease_linear(t):
+    """Linear interpolation"""
+    return t
+
+def ease_out(t):
+    """Decelerate - fast start, slow end (good for hitting beats)"""
+    return 1.0 - (1.0 - t) ** 2
+
+def ease_in_out(t):
+    """Smooth acceleration and deceleration"""
+    return t * t * (3.0 - 2.0 * t)
+
+def ease_bounce(t):
+    """Bounce effect at the end"""
+    if t < 0.5:
+        return 2 * t * t
+    else:
+        t2 = t - 0.5
+        return 0.5 + t2 * (1.0 - t2) * 4
+
+def ease_elastic(t):
+    """Overshoot and settle back"""
+    if t == 0 or t == 1:
+        return t
+    p = 0.3
+    s = p / 4.0
+    t -= 1
+    return -(math.pow(2, 10 * t) * math.sin((t - s) * (2 * math.pi) / p)) + 1
+
+def ease_punch(t):
+    """Sharp hit then quick settle - great for dance hits"""
+    if t < 0.3:
+        return (t / 0.3) ** 0.5  # Fast attack
+    else:
+        return 1.0 - (1.0 - t) * 0.15  # Subtle settle
+
+EASING_FUNCTIONS = {
+    "linear": ease_linear,
+    "ease_out": ease_out,
+    "ease_in_out": ease_in_out,
+    "bounce": ease_bounce,
+    "elastic": ease_elastic,
+    "punch": ease_punch,
+}
 
 DANCE_POSES = {
     "neutral": {
@@ -563,18 +612,23 @@ class SCAILBeatDrivenPose:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "base_pose": ("SCAIL_POSE",),
-                "beat_info": ("SCAIL_BEAT_INFO",),
-                "audio_features": ("SCAIL_AUDIO_FEATURES",),
-                "dance_style": (["auto"] + sorted(list(PRESET_SEQUENCES.keys())), {"default": "auto"}),
-                "interaction_mode": (["unison", "mirror", "random"], {"default": "mirror"}),
-                "energy_style": (["auto", "low", "medium", "high"], {"default": "auto"}),
-                "motion_smoothness": ("FLOAT", {"default": 0.5, "min": 0.1, "max": 3.0, "tooltip": "Lower = snappier poses that show dance style differences, higher = smoother/floaty transitions"}),
+                "base_pose": ("SCAIL_POSE", {"tooltip": "Base skeleton pose from DWPose or Generator"}),
+                "beat_info": ("SCAIL_BEAT_INFO", {"tooltip": "Beat detection data from SCAILBeatDetector"}),
+                "audio_features": ("SCAIL_AUDIO_FEATURES", {"tooltip": "Audio analysis from SCAILAudioFeatureExtractor"}),
+                "dance_style": (["auto"] + sorted(list(PRESET_SEQUENCES.keys())), {"default": "auto", "tooltip": "Dance style preset. 'auto' selects moves based on energy level."}),
+                "interaction_mode": (["unison", "mirror", "random"], {"default": "mirror", "tooltip": "Multi-character coordination: unison=same moves, mirror=left/right swapped, random=independent"}),
+                "energy_style": (["auto", "low", "medium", "high"], {"default": "auto", "tooltip": "Override energy detection. 'auto' uses audio RMS."}),
+                "motion_smoothness": ("FLOAT", {"default": 0.5, "min": 0.1, "max": 3.0, "tooltip": "Lower = snappier, higher = smoother/floaty"}),
                 "anticipation": ("INT", {"default": 3, "min": 0, "max": 10, "tooltip": "Frames to start moving BEFORE beat"}),
-                "groove_amount": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 3.0, "tooltip": "Hip sine wave intensity"}),
-                "bass_intensity": ("FLOAT", {"default": 1.2, "min": 0.0, "max": 5.0}),
-                "treble_intensity": ("FLOAT", {"default": 1.2, "min": 0.0, "max": 5.0}),
-                "seed": ("INT", {"default": 0, "min": 0, "max": 99999}),
+                "groove_amount": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 3.0, "tooltip": "Hip sway/bounce intensity synced to tempo"}),
+                "bass_intensity": ("FLOAT", {"default": 1.2, "min": 0.0, "max": 5.0, "tooltip": "How much bass drives motion snap"}),
+                "treble_intensity": ("FLOAT", {"default": 1.2, "min": 0.0, "max": 5.0, "tooltip": "How much treble drives arm movement"}),
+                "phrase_bars": ([4, 8, 16], {"default": 8, "tooltip": "Bars per phrase. Choreography changes on phrase boundaries."}),
+                "staging_mode": (["off", "subtle", "dynamic"], {"default": "subtle", "tooltip": "Stage movement: off=stationary, subtle=small sway, dynamic=larger travel"}),
+                "hit_easing": (["linear", "ease_out", "ease_in_out", "bounce", "elastic", "punch"], {"default": "ease_out", "tooltip": "Motion curve for pose transitions. Affects how moves hit the beat."}),
+                "pose_blend": ("FLOAT", {"default": 0.3, "min": 0.0, "max": 1.0, "tooltip": "Blend between poses. 0=hard keyframes, 1=maximum smoothing between poses"}),
+                "loop_mode": ("BOOLEAN", {"default": False, "tooltip": "Ensure first and last frames match for seamless looping"}),
+                "seed": ("INT", {"default": 0, "min": 0, "max": 99999, "tooltip": "Random seed for deterministic choreography"}),
             }
         }
     
@@ -599,8 +653,11 @@ class SCAILBeatDrivenPose:
     AXES = {"nod": 0, "forward": 0, "bend": 0, "turn": 1, "twist": 1, "tilt": 2, "raise": 2}
 
     def _create_neutral_structure(self, char_pose):
-        """Construct a straight, standing pose based on the limb lengths of the reference."""
+        """Construct a neutral standing pose based on the limb lengths of the reference.
+        Straightens both legs AND arms to create a consistent base for dance poses."""
         neutral = char_pose.copy()
+        
+        # === NEUTRALIZE LEGS ===
         r_hip = char_pose[8]
         l_hip = char_pose[11]
         
@@ -617,7 +674,6 @@ class SCAILBeatDrivenPose:
         
         r_y = np.sqrt(max(0, r_len**2 - r_stance_x**2 - r_stance_z**2))
         neutral[10] = r_hip + np.array([r_stance_x, r_y, r_stance_z])
-        # Place knee along the hip-to-ankle line, not just midpoint
         r_dir = neutral[10] - r_hip
         r_dir_norm = r_dir / (np.linalg.norm(r_dir) + 1e-8)
         r_thigh_len = np.linalg.norm(char_pose[9] - char_pose[8])
@@ -625,11 +681,33 @@ class SCAILBeatDrivenPose:
 
         l_y = np.sqrt(max(0, l_len**2 - l_stance_x**2 - l_stance_z**2))
         neutral[13] = l_hip + np.array([l_stance_x, l_y, l_stance_z])
-        # Place knee along the hip-to-ankle line, not just midpoint
         l_dir = neutral[13] - l_hip
         l_dir_norm = l_dir / (np.linalg.norm(l_dir) + 1e-8)
         l_thigh_len = np.linalg.norm(char_pose[12] - char_pose[11])
         neutral[12] = l_hip + l_dir_norm * l_thigh_len
+        
+        # === NEUTRALIZE ARMS ===
+        # Right arm: shoulder(2) -> elbow(3) -> wrist(4)
+        r_shoulder = char_pose[2]
+        r_upper_arm_len = np.linalg.norm(char_pose[3] - char_pose[2])
+        r_forearm_len = np.linalg.norm(char_pose[4] - char_pose[3])
+        
+        # Neutral arm position: slightly down and forward (relaxed idle)
+        r_arm_dir = np.array([-0.8, 0.5, 0.2])  # Down, slightly out, slightly forward
+        r_arm_dir = r_arm_dir / (np.linalg.norm(r_arm_dir) + 1e-8)
+        neutral[3] = r_shoulder + r_arm_dir * r_upper_arm_len  # elbow
+        neutral[4] = neutral[3] + r_arm_dir * r_forearm_len    # wrist
+        
+        # Left arm: shoulder(5) -> elbow(6) -> wrist(7)
+        l_shoulder = char_pose[5]
+        l_upper_arm_len = np.linalg.norm(char_pose[6] - char_pose[5])
+        l_forearm_len = np.linalg.norm(char_pose[7] - char_pose[6])
+        
+        # Mirror for left arm
+        l_arm_dir = np.array([0.8, 0.5, 0.2])  # Down, slightly out (mirrored), slightly forward
+        l_arm_dir = l_arm_dir / (np.linalg.norm(l_arm_dir) + 1e-8)
+        neutral[6] = l_shoulder + l_arm_dir * l_upper_arm_len  # elbow
+        neutral[7] = neutral[6] + l_arm_dir * l_forearm_len    # wrist
         
         return neutral
 
@@ -677,15 +755,19 @@ class SCAILBeatDrivenPose:
         joints = apply_chain_rotation(joints, 1, [0, 14, 15, 16, 17], 2, np.radians(-sway * 0.1))
         return joints
 
-    def generate(self, base_pose, beat_info, audio_features, dance_style, interaction_mode, energy_style, motion_smoothness, anticipation, groove_amount, bass_intensity, treble_intensity, seed):
+    def generate(self, base_pose, beat_info, audio_features, dance_style, interaction_mode, energy_style, motion_smoothness, anticipation, groove_amount, bass_intensity, treble_intensity, phrase_bars, staging_mode, hit_easing, pose_blend, loop_mode, seed):
         rng = np.random.default_rng(seed)
         base_joints_all = base_pose["joints"].numpy()
         char_count = base_pose.get("char_count", 1)
-        print(f"[SCAIL] Animating {char_count} characters. Style: {dance_style}")
+        print(f"[SCAIL] Animating {char_count} characters. Style: {dance_style}, Phrase: {phrase_bars} bars, Easing: {hit_easing}, Loop: {loop_mode}")
+        
+        # Get easing function
+        easing_func = EASING_FUNCTIONS.get(hit_easing, ease_out)
         
         frame_count = beat_info["frame_count"]
         fps = beat_info["fps"]
         beat_frames = beat_info["beat_frames"]
+        downbeat_frames = beat_info.get("downbeat_frames", beat_frames[::4] if len(beat_frames) >= 4 else beat_frames)
         tempo = beat_info["tempo"]
         energy = beat_info["energy"].numpy()
         bass = audio_features["bass"].numpy()
@@ -695,52 +777,140 @@ class SCAILBeatDrivenPose:
             bass = np.interp(np.linspace(0,1,frame_count), np.linspace(0,1,len(bass)), bass)
             treble = np.interp(np.linspace(0,1,frame_count), np.linspace(0,1,len(treble)), treble)
 
+        # Calculate phrase timing
+        if len(beat_frames) >= 2:
+            frames_per_beat = float(np.median(np.diff(beat_frames)))
+        else:
+            frames_per_beat = (60.0 * fps) / max(tempo, 1.0)
+        
+        phrase_len_frames = int(frames_per_beat * 4.0 * phrase_bars)  # 4 beats per bar
+        phrase_len_frames = max(1, phrase_len_frames)
+        
+        # Build phrase boundaries from downbeats or regular intervals
+        if len(downbeat_frames) >= 2:
+            phrase_starts = [int(downbeat_frames[i]) for i in range(0, len(downbeat_frames), phrase_bars)]
+        else:
+            phrase_starts = list(range(0, frame_count, phrase_len_frames))
+        if not phrase_starts or phrase_starts[0] != 0:
+            phrase_starts = [0] + phrase_starts
+        phrase_start_set = set(phrase_starts)
+
+        # Staging positions (normalized, will be scaled per character)
+        stage_positions = [
+            np.array([0.0, 0.0, 0.0]),
+            np.array([0.3, 0.0, 0.0]),
+            np.array([-0.3, 0.0, 0.0]),
+            np.array([0.15, 0.1, 0.0]),
+            np.array([-0.15, 0.1, 0.0]),
+            np.array([0.2, -0.08, 0.0]),
+            np.array([-0.2, -0.08, 0.0]),
+        ]
+        # Scales: subtle = gentle sway, dynamic = noticeable travel
+        staging_scale = {"off": 0.0, "subtle": 0.4, "dynamic": 0.8}.get(staging_mode, 0.4)
+
         char_keyframes = [] 
+        char_stage_targets = []  # Track stage position per character
         
         for c in range(char_count):
             keyframes = {0: "neutral"}
             current_combo = []
             combo_idx = 0
-            beat_counter = 0
+            current_phrase = -1
             char_rng = np.random.default_rng(seed + c)
+            
+            # Initialize stage position
+            char_stage_targets.append({"current": np.zeros(3), "target": np.zeros(3), "start_frame": 0})
             
             for beat_frame in beat_frames:
                 target_frame = max(0, beat_frame - anticipation)
-                local_energy = np.mean(energy[max(0, beat_frame-5):min(len(energy), beat_frame+5)])
                 
-                # DETERMINE POSE LIST BASED ON STYLE
-                if dance_style == "auto":
-                    style = energy_style if energy_style != "auto" else ("high" if local_energy > 0.6 else "medium" if local_energy > 0.3 else "low")
-                    available_combos = MOVE_COMBOS.get(style, MOVE_COMBOS["medium"])
-                else:
-                    # Use specific preset list (wrapped in list for compatibility)
-                    available_combos = [PRESET_SEQUENCES.get(dance_style, PRESET_SEQUENCES["hip_hop"])]
+                # Check if we're in a new phrase
+                phrase_idx = sum(1 for ps in phrase_starts if ps <= target_frame) - 1
+                new_phrase = phrase_idx != current_phrase
+                
+                if new_phrase:
+                    current_phrase = phrase_idx
+                    # Pick new combo for this phrase
+                    phrase_start = phrase_starts[phrase_idx] if phrase_idx < len(phrase_starts) else 0
+                    phrase_end = phrase_starts[phrase_idx + 1] if phrase_idx + 1 < len(phrase_starts) else frame_count
+                    local_energy = np.mean(energy[phrase_start:phrase_end])
+                    
+                    if dance_style == "auto":
+                        style = energy_style if energy_style != "auto" else ("high" if local_energy > 0.6 else "medium" if local_energy > 0.3 else "low")
+                        available_combos = MOVE_COMBOS.get(style, MOVE_COMBOS["medium"])
+                    else:
+                        available_combos = [PRESET_SEQUENCES.get(dance_style, PRESET_SEQUENCES["hip_hop"])]
+                    
+                    if c == 0 or interaction_mode == "random":
+                        current_combo = available_combos[char_rng.integers(0, len(available_combos))]
+                        combo_idx = 0
+                        
+                        # Update stage target for this phrase
+                        if staging_mode != "off":
+                            new_stage = stage_positions[char_rng.integers(0, len(stage_positions))]
+                            char_stage_targets[c]["target"] = new_stage * staging_scale
+                            char_stage_targets[c]["start_frame"] = target_frame
 
                 pose_name = "neutral"
                 if c == 0 or interaction_mode == "random":
-                    if beat_counter % 4 == 0 or not current_combo:
-                        current_combo = available_combos[char_rng.integers(0, len(available_combos))]
-                        combo_idx = 0
                     pose_name = current_combo[combo_idx % len(current_combo)]
                 
                 elif interaction_mode == "unison":
                     pose_name = char_keyframes[0].get(target_frame, "neutral")
+                    # Copy leader's stage target
+                    if new_phrase and staging_mode != "off":
+                        char_stage_targets[c]["target"] = char_stage_targets[0]["target"].copy()
+                        char_stage_targets[c]["start_frame"] = target_frame
                     
                 elif interaction_mode == "mirror":
                     leader_pose = char_keyframes[0].get(target_frame, "neutral")
                     if "left" in leader_pose: pose_name = leader_pose.replace("left", "right")
                     elif "right" in leader_pose: pose_name = leader_pose.replace("right", "left")
                     else: pose_name = leader_pose
+                    # Mirror leader's stage X position
+                    if new_phrase and staging_mode != "off":
+                        leader_target = char_stage_targets[0]["target"]
+                        char_stage_targets[c]["target"] = np.array([-leader_target[0], leader_target[1], leader_target[2]])
+                        char_stage_targets[c]["start_frame"] = target_frame
 
                 keyframes[target_frame] = pose_name
                 combo_idx += 1
-                beat_counter += 1
             
             char_keyframes.append(keyframes)
+
+        # Loop mode: ensure last pose returns to first pose
+        if loop_mode and len(beat_frames) > 0:
+            # Add a keyframe at the end that mirrors the start
+            loop_blend_frames = int(frames_per_beat * 2)  # 2 beats to blend back
+            for c in range(char_count):
+                first_pose = char_keyframes[c].get(0, "neutral")
+                char_keyframes[c][max(0, frame_count - loop_blend_frames)] = first_pose
+
+        # Build sorted keyframe list per character for interpolation
+        char_keyframe_times = []
+        char_keyframe_poses = []
+        for c in range(char_count):
+            times = sorted(char_keyframes[c].keys())
+            poses = [char_keyframes[c][t] for t in times]
+            char_keyframe_times.append(times)
+            char_keyframe_poses.append(poses)
 
         motion = MotionDynamics(base_joints_all.copy(), num_joints=18*char_count)
         motion.dt = 1.0 / fps
         pose_sequence = []
+        
+        # Pre-compute all target poses for blending
+        char_pose_cache = {}  # (char_idx, pose_name) -> pose array
+        
+        def get_pose_for_char(c, pose_name):
+            key = (c, pose_name)
+            if key not in char_pose_cache:
+                char_ref = base_joints_all[c*18:(c+1)*18]
+                char_base = self._create_neutral_structure(char_ref)
+                scale = self._get_body_scale(char_ref)
+                char_pose_cache[key] = self._apply_pose(char_base, pose_name, scale_factor=scale)
+            return char_pose_cache[key]
+
         current_targets = [base_joints_all[i*18:(i+1)*18].copy() for i in range(char_count)]
         
         for c in range(char_count):
@@ -752,11 +922,58 @@ class SCAILBeatDrivenPose:
             full_target_pose = []
             for c in range(char_count):
                 char_ref = base_joints_all[c*18:(c+1)*18]
-                char_base = self._create_neutral_structure(char_ref)
                 scale = self._get_body_scale(char_ref)
                 
-                if i in char_keyframes[c]:
-                    current_targets[c] = self._apply_pose(char_base, char_keyframes[c][i], scale_factor=scale)
+                times = char_keyframe_times[c]
+                poses = char_keyframe_poses[c]
+                
+                # Find surrounding keyframes for blending
+                prev_idx = 0
+                for idx, t in enumerate(times):
+                    if t <= i:
+                        prev_idx = idx
+                    else:
+                        break
+                
+                next_idx = min(prev_idx + 1, len(times) - 1)
+                prev_time = times[prev_idx]
+                next_time = times[next_idx]
+                prev_pose_name = poses[prev_idx]
+                next_pose_name = poses[next_idx]
+                
+                prev_pose = get_pose_for_char(c, prev_pose_name)
+                next_pose = get_pose_for_char(c, next_pose_name)
+                
+                # Calculate blend factor with easing
+                if next_time > prev_time:
+                    raw_t = (i - prev_time) / (next_time - prev_time)
+                    raw_t = np.clip(raw_t, 0.0, 1.0)
+                    # Apply easing function
+                    eased_t = easing_func(raw_t)
+                    # Apply pose_blend parameter (0 = snap to keyframes, 1 = full blend)
+                    blend_t = eased_t * pose_blend + (1.0 if raw_t >= 1.0 else 0.0) * (1.0 - pose_blend)
+                else:
+                    blend_t = 1.0
+                
+                # Blend between poses
+                blended_pose = prev_pose * (1.0 - blend_t) + next_pose * blend_t
+                current_targets[c] = blended_pose
+                
+                # Apply staging offset with smooth interpolation
+                if staging_mode != "off":
+                    st = char_stage_targets[c]
+                    # Smooth interpolation toward target
+                    blend = 0.02  # Gradual movement
+                    st["current"] = st["current"] * (1 - blend) + st["target"] * blend
+                    
+                    # Clamp to safe range (don't let characters walk out of frame)
+                    max_offset = 0.5  # Maximum normalized offset
+                    st["current"][0] = np.clip(st["current"][0], -max_offset, max_offset)
+                    st["current"][1] = np.clip(st["current"][1], -max_offset * 0.4, max_offset * 0.4)
+                    
+                    stage_offset = st["current"] * scale * 120  # Scale to world units
+                    current_targets[c] = current_targets[c] + stage_offset
+                
                 full_target_pose.append(current_targets[c])
             
             flat_target = np.concatenate(full_target_pose, axis=0)
@@ -791,6 +1008,17 @@ class SCAILBeatDrivenPose:
                 joints[start:end] = char_joints
 
             pose_sequence.append(joints.copy())
+        
+        # Loop mode: blend last few frames back to first frame
+        if loop_mode and len(pose_sequence) > 1:
+            blend_frames = min(int(frames_per_beat), len(pose_sequence) // 4)
+            if blend_frames > 0:
+                first_pose = pose_sequence[0]
+                for b in range(blend_frames):
+                    idx = len(pose_sequence) - blend_frames + b
+                    t = (b + 1) / (blend_frames + 1)
+                    t = easing_func(t)  # Apply easing to loop blend too
+                    pose_sequence[idx] = pose_sequence[idx] * (1.0 - t) + first_pose * t
             
         return ({"poses": pose_sequence, "limb_seq": base_pose["limb_seq"], "bone_colors": base_pose["bone_colors"]},)
 
@@ -803,12 +1031,12 @@ class SCAILPoseRenderer:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "pose_sequence": ("SCAIL_POSE_SEQUENCE",),
-                "width": ("INT", {"default": 512}),
-                "height": ("INT", {"default": 768}),
-                "auto_half_resolution": ("BOOLEAN", {"default": True}),
-                "fov": ("FLOAT", {"default": 55.0}),
-                "cylinder_pixel_radius": ("FLOAT", {"default": 4.0}),
+                "pose_sequence": ("SCAIL_POSE_SEQUENCE", {"tooltip": "Animated pose sequence from SCAILBeatDrivenPose"}),
+                "width": ("INT", {"default": 512, "min": 64, "max": 4096, "tooltip": "Output image width in pixels"}),
+                "height": ("INT", {"default": 768, "min": 64, "max": 4096, "tooltip": "Output image height in pixels"}),
+                "auto_half_resolution": ("BOOLEAN", {"default": True, "tooltip": "Render at half res then upscale. Faster."}),
+                "fov": ("FLOAT", {"default": 55.0, "min": 10.0, "max": 120.0, "tooltip": "Field of view in degrees"}),
+                "cylinder_pixel_radius": ("FLOAT", {"default": 4.0, "min": 1.0, "max": 20.0, "tooltip": "Thickness of skeleton limbs"}),
             }
         }
     
@@ -858,12 +1086,15 @@ class SCAILPoseFromDWPose:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "image_width": ("INT", {"default": 512}),
-                "image_height": ("INT", {"default": 768}),
-                "depth": ("FLOAT", {"default": 800.0}),
-                "fov": ("FLOAT", {"default": 55.0}),
+                "image_width": ("INT", {"default": 512, "min": 64, "max": 4096, "tooltip": "Width of source image that DWPose was run on"}),
+                "image_height": ("INT", {"default": 768, "min": 64, "max": 4096, "tooltip": "Height of source image that DWPose was run on"}),
+                "depth": ("FLOAT", {"default": 800.0, "min": 100.0, "max": 5000.0, "tooltip": "Assumed Z-depth for 2D to 3D conversion"}),
+                "fov": ("FLOAT", {"default": 55.0, "min": 10.0, "max": 120.0, "tooltip": "Field of view for projection. Match your render FOV."}),
             },
-            "optional": {"dw_poses": ("DWPOSES",), "pose_keypoint": ("POSE_KEYPOINT",)}
+            "optional": {
+                "dw_poses": ("DWPOSES", {"tooltip": "DWPose output (preferred format)"}),
+                "pose_keypoint": ("POSE_KEYPOINT", {"tooltip": "Alternative OpenPose-style keypoint input"})
+            }
         }
     RETURN_TYPES = ("SCAIL_POSE",)
     FUNCTION = "extract"
@@ -959,10 +1190,17 @@ class SCAILPoseFromDWPose:
 class SCAILAlignPoseToReference:
     @classmethod
     def INPUT_TYPES(cls):
-        return {"required": {"pose_sequence": ("SCAIL_POSE_SEQUENCE",), "reference_pose": ("SCAIL_POSE",)}}
+        return {
+            "required": {
+                "pose_sequence": ("SCAIL_POSE_SEQUENCE", {"tooltip": "Animated pose sequence to align"}),
+                "reference_pose": ("SCAIL_POSE", {"tooltip": "Target pose to align to (uses neck position)"})
+            }
+        }
     RETURN_TYPES = ("SCAIL_POSE_SEQUENCE",)
+    RETURN_NAMES = ("aligned_sequence",)
     FUNCTION = "align"
     CATEGORY = "SCAIL-AudioReactive"
+    
     def align(self, pose_sequence, reference_pose):
         poses = [p.copy() for p in pose_sequence["poses"]]
         if not poses: return (pose_sequence,)
