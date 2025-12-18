@@ -1,7 +1,6 @@
-[README.md](https://github.com/user-attachments/files/24198748/README.md)
 # ComfyUI-SCAIL-AudioReactive
 
-Generate audio-reactive SCAIL pose sequences for character animation without requiring input video tracking. Now supports **Multi-Character Choreography**.
+Generate audio-reactive SCAIL pose sequences for character animation without requiring input video tracking. Now supports **Multi-Character Choreography** and **AIST++ Motion Capture Dance Data**.
 
 ## What it does
 
@@ -12,6 +11,7 @@ Creates SCAIL-compatible 3D skeleton pose renders driven by audio analysis. Inst
 3. **Physics Simulation** — Momentum, drag, and "Sticky Feet" constraints for grounded motion
 4. **Auto-Rigging** — Automatically corrects "non-neutral" reference poses (e.g., character starting with foot up)
 5. **Dynamic Scaling** — Adjusts movement amplitude based on character size/distance to prevent collisions
+6. **AIST++ Dance Library** — Real motion capture dance data from professional dancers across 10 genres
 
 ## Nodes
 
@@ -30,6 +30,27 @@ Creates SCAIL-compatible 3D skeleton pose renders driven by audio analysis. Inst
   - Includes **80+ Dance Poses** (Hip Hop, Rock, Pop, etc.)
 - **SCAILAlignPoseToReference** — Align generated pose sequence to match reference position/scale.
 
+### AIST++ Dance Library (NEW)
+Real motion capture data from the AIST++ dataset — professional dancers performing choreographed routines across 10 genres. Auto-downloads from HuggingFace on first use.
+
+**Chunk-Based (Reactive):**
+- **SCAILAISTLibraryLoader** — Loads the chunked dance library (~220MB, auto-downloads).
+- **SCAILAISTBeatDance** — Beat-triggered chunk selection based on audio energy.
+  - Mix multiple genres (break, pop, lock, etc.)
+  - Energy-aware: low/mid/high energy chunks matched to audio
+  - Chunks chain for longer sequences
+  - **Note:** Can be janky at transitions since chunks are cut at velocity minimums, not perfect phrase boundaries. Good for variety and reactivity, less smooth than full sequences.
+- **SCAILAISTChunkPreview** — Preview individual chunks by genre/energy.
+
+**Full Sequence (Smooth):**
+- **SCAILAISTFullLoader** — Loads full dance sequences (~200MB, auto-downloads).
+- **SCAILAISTFullSequence** — Plays complete choreographed dances.
+  - Single genre dropdown (no mixing)
+  - Smooth, continuous motion from real performances
+  - **Note:** Can feel repetitive if you recognize the source choreography. Best for shorter generations or when you want authentic, uncut dance motion.
+
+**Available Genres:** break, pop, lock, waack, krump, house, street_jazz, ballet_jazz, la_hip_hop, middle_hip_hop
+
 ### Rendering
 - **SCAILPoseRenderer** — Render pose sequence to SCAIL-style 3D cylinder images.
 - **SCAILPosePreview** — Visualize extracted audio features.
@@ -38,11 +59,17 @@ Creates SCAIL-compatible 3D skeleton pose renders driven by audio analysis. Inst
 ## Installation
 
 1. Clone to your ComfyUI custom_nodes folder:
+   ```
    cd ComfyUI/custom_nodes
    git clone https://github.com/ckinpdx/ComfyUI-SCAIL-AudioReactive
+   ```
 
 2. Install requirements:
+   ```
    pip install -r requirements.txt
+   ```
+
+AIST++ data downloads automatically on first use (~200-220MB per library).
 
 ## Parameters
 
@@ -69,6 +96,18 @@ Creates SCAIL-compatible 3D skeleton pose renders driven by audio analysis. Inst
 - `bass_intensity` — Bass → vertical bounce (scaled to body size).
 - `treble_intensity` — Treble → arm/hand jitter.
 
+### SCAILAISTBeatDance (Chunk Mode)
+- `sync_dancers` — All dancers do same moves (true) or independent (false).
+- `genre_*` toggles — Enable/disable each of the 10 dance genres.
+- `transition_frames` — Frames to blend between chunks (smooths transitions).
+- `chunks_per_beat` — Chain consecutive chunks (1=0.5s, 2=1s, etc.).
+- `energy_sensitivity` — How strongly audio energy affects chunk selection.
+
+### SCAILAISTFullSequence (Full Sequence Mode)
+- `genre` — Single genre dropdown.
+- `transition_frames` — Frames to blend from reference pose to dance start.
+- `start_beat` — Which beat in the source to start from (0=beginning).
+
 ### SCAILPoseFromDWPose
 - **Note:** This node strictly extracts what is detected in your reference image. It does not clone characters. To animate 3 people, you need a reference image with 3 people.
 
@@ -79,6 +118,17 @@ If you are using a reference image with multiple people (e.g., a band or dance t
 1. **Resolution:** Set upstream detector resolution to **1024** or higher for group shots.
 2. **Model:** Use **`yolo_nas_l_fp16.onnx`** or **`yolox_x.onnx`** for the BBox detector. Standard `yolox_l` often misses people in complex poses (e.g., arms touching) or back rows.
 3. **Max People:** Ensure the upstream node allows `max_people > 1` (if using OpenPose).
+
+## AIST++ vs Procedural Animation
+
+| Feature | Procedural (BeatDrivenPose) | AIST++ Chunks | AIST++ Full |
+|---------|----------------------------|---------------|-------------|
+| Motion Quality | Synthetic, can look robotic | Real mocap, natural | Real mocap, natural |
+| Variety | 80+ poses, infinite combos | 10 genres, ~44k chunks | 10 genres, ~1400 sequences |
+| Audio Reactivity | High (every beat) | Medium (energy-based) | Low (just plays) |
+| Transitions | Smooth (physics-based) | Can be janky | Smooth (continuous) |
+| Floor Work | Limited | Full (breakdance etc) | Full |
+| Best For | Stylized, rhythmic loops | Reactive, varied | Authentic, cinematic |
 
 ## Technical Details
 
@@ -91,6 +141,9 @@ If your reference image has a character standing on one leg or mid-stride, the s
 ### Scale-Aware Movement
 Movements are normalized based on the character's torso length. A small character in the background will perform smaller absolute movements than a character in the foreground, maintaining correct perspective and preventing characters from colliding.
 
+### AIST++ Data Processing
+The AIST++ dance data is converted from COCO 17-keypoint format to OpenPose 18-keypoint format for SCAIL compatibility. Chunks are cut at velocity minimums (natural pauses in movement) rather than fixed intervals to preserve move integrity. Energy tagging uses velocity + acceleration metrics, calculated per-genre to account for style differences (krump is naturally higher energy than house).
+
 ## Credits
 
 - SCAIL: [zai-org/SCAIL](https://github.com/zai-org/SCAIL)
@@ -98,3 +151,4 @@ Movements are normalized based on the character's torso length. A small characte
 - ComfyUI integration: [kijai/ComfyUI-SCAIL-Pose](https://github.com/kijai/ComfyUI-SCAIL-Pose)
 - Beat detection: [librosa](https://librosa.org/)
 - Expanded Pose Library: Discord user **NebSH**
+- AIST++ Dataset: [Google Research](https://google.github.io/aistplusplus_dataset/) — "AI Choreographer: Music Conditioned 3D Dance Generation with AIST++" (Li et al., ICCV 2021) — CC-BY-4.0 License

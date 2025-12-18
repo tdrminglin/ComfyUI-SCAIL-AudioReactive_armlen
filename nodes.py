@@ -1,6 +1,12 @@
 import torch
 import numpy as np
 import math
+import os
+import json
+import random
+import tarfile
+import urllib.request
+import shutil
 from typing import List, Tuple, Dict, Optional
 
 # CORRECTED IMPORT: Looks inside the render_3d folder
@@ -1208,6 +1214,978 @@ class SCAILAlignPoseToReference:
         offset = reference_pose["joints"][1].numpy() - poses[0][1] 
         for i in range(len(poses)): poses[i] += offset
         return ({"poses": poses, "limb_seq": pose_sequence["limb_seq"], "bone_colors": pose_sequence["bone_colors"]},)
+        
+# ============================================================================
+# AIST++ CHUNK LIBRARY NODES
+# ============================================================================
+
+# HuggingFace dataset URL
+AIST_HF_URL = "https://huggingface.co/datasets/ckinpdx/aist_chunks/resolve/main/aist_chunks_v2.tar.gz"
+
+def get_aist_library_path():
+    """Get default path for AIST chunks - in ComfyUI models folder"""
+    # Try to find ComfyUI folder
+    comfy_path = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    return os.path.join(comfy_path, "models", "aist_chunks")
+
+def download_aist_library(destination):
+    """Download and extract AIST chunks from HuggingFace"""
+    os.makedirs(destination, exist_ok=True)
+    
+    tar_path = os.path.join(destination, "aist_chunks.tar.gz")
+    
+    print(f"[AIST] Downloading from HuggingFace...")
+    print(f"[AIST] This is ~100MB, may take a few minutes...")
+    
+    # Download with progress
+    def report_progress(block_num, block_size, total_size):
+        downloaded = block_num * block_size
+        percent = min(100, downloaded * 100 // total_size)
+        mb_down = downloaded / (1024 * 1024)
+        mb_total = total_size / (1024 * 1024)
+        print(f"\r[AIST] Downloading: {percent}% ({mb_down:.1f}/{mb_total:.1f} MB)", end="", flush=True)
+    
+    urllib.request.urlretrieve(AIST_HF_URL, tar_path, report_progress)
+    print()  # newline after progress
+    
+    print(f"[AIST] Extracting...")
+    with tarfile.open(tar_path, "r:gz") as tar:
+        tar.extractall(destination)
+    
+    # Move contents up if nested (tar might create aist_chunks/aist_chunks/)
+    nested = os.path.join(destination, "aist_chunks")
+    if os.path.exists(nested) and os.path.isdir(nested):
+        for item in os.listdir(nested):
+            src = os.path.join(nested, item)
+            dst = os.path.join(destination, item)
+            if not os.path.exists(dst):
+                shutil.move(src, dst)
+        shutil.rmtree(nested)
+    
+    # Clean up tar
+    os.remove(tar_path)
+    
+    print(f"[AIST] Done! Library at: {destination}")
+
+
+class SCAILAISTLibraryLoader:
+    """
+    Loads the AIST++ chunk library. Auto-downloads from HuggingFace on first use.
+    """
+    
+    @classmethod
+    def INPUT_TYPES(cls):
+        default_path = get_aist_library_path()
+        return {
+            "required": {
+                "library_path": ("STRING", {
+                    "default": default_path,
+                    "tooltip": "Path to aist_chunks folder. Leave default to auto-download."
+                }),
+                "auto_download": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Automatically download from HuggingFace if not found"
+                }),
+            }
+        }
+    
+    RETURN_TYPES = ("AIST_LIBRARY",)
+    RETURN_NAMES = ("library",)
+    FUNCTION = "load"
+    CATEGORY = "SCAIL-AudioReactive/AIST"
+    
+    def load(self, library_path, auto_download):
+        index_path = os.path.join(library_path, "index.json")
+        
+        # Check if we need to download
+        if not os.path.exists(index_path):
+            if auto_download:
+                print(f"[AIST] Library not found at {library_path}")
+                download_aist_library(library_path)
+            else:
+                raise FileNotFoundError(
+                    f"index.json not found in {library_path}. "
+                    "Enable auto_download or provide correct path."
+                )
+        
+        # Load index
+        with open(index_path, 'r') as f:
+            index = json.load(f)
+        
+        index['_base_path'] = library_path
+        
+        total = sum(
+            len(chunks) 
+            for genre in index['chunks'].values() 
+            for chunks in genre.values()
+        )
+        print(f"[AIST] Loaded library: {len(index['chunks'])} genres, {total} chunks")
+        
+        return (index,)
+
+
+class SCAILAISTBeatDance:
+    """
+    Generates dance sequences from AIST++ chunks, triggered by beats.
+    Selects chunks based on audio energy and blends from reference pose.
+    """
+    
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "library": ("AIST_LIBRARY", {"tooltip": "AIST chunk library from loader"}),
+                "beat_info": ("SCAIL_BEAT_INFO", {"tooltip": "Beat detection from SCAILBeatDetector"}),
+                "audio_features": ("SCAIL_AUDIO_FEATURES", {"tooltip": "Audio features for energy mapping"}),
+                "sync_dancers": ("BOOLEAN", {"default": True, "tooltip": "All dancers do same moves (True) or independent (False)"}),
+                "genre_break": ("BOOLEAN", {"default": True, "tooltip": "Include breakdance moves"}),
+                "genre_pop": ("BOOLEAN", {"default": True, "tooltip": "Include popping moves"}),
+                "genre_lock": ("BOOLEAN", {"default": True, "tooltip": "Include locking moves"}),
+                "genre_waack": ("BOOLEAN", {"default": False, "tooltip": "Include waacking moves"}),
+                "genre_krump": ("BOOLEAN", {"default": False, "tooltip": "Include krumping moves"}),
+                "genre_house": ("BOOLEAN", {"default": False, "tooltip": "Include house moves"}),
+                "genre_street_jazz": ("BOOLEAN", {"default": False, "tooltip": "Include street jazz moves"}),
+                "genre_ballet_jazz": ("BOOLEAN", {"default": False, "tooltip": "Include ballet jazz moves"}),
+                "genre_la_hip_hop": ("BOOLEAN", {"default": False, "tooltip": "Include LA hip hop moves"}),
+                "genre_middle_hip_hop": ("BOOLEAN", {"default": False, "tooltip": "Include middle hip hop moves"}),
+                "transition_frames": ("INT", {
+                    "default": 6, "min": 1, "max": 30,
+                    "tooltip": "Frames to blend between chunks"
+                }),
+                "chunks_per_beat": ("INT", {
+                    "default": 1, "min": 1, "max": 4,
+                    "tooltip": "Chain consecutive chunks together (1=0.5s, 2=1s, 3=1.5s, 4=2s per beat)"
+                }),
+                "energy_sensitivity": ("FLOAT", {
+                    "default": 1.0, "min": 0.0, "max": 3.0,
+                    "tooltip": "How strongly audio energy affects chunk selection"
+                }),
+                "seed": ("INT", {
+                    "default": 0, "min": 0, "max": 0xffffffff,
+                    "tooltip": "Random seed for chunk selection"
+                }),
+            },
+            "optional": {
+                "reference_pose": ("SCAIL_POSE", {
+                    "tooltip": "Starting pose from DWPose to blend from"
+                }),
+            }
+        }
+    
+    RETURN_TYPES = ("SCAIL_POSE_SEQUENCE",)
+    RETURN_NAMES = ("pose_sequence",)
+    FUNCTION = "generate"
+    CATEGORY = "SCAIL-AudioReactive/AIST"
+    
+    def generate(self, library, beat_info, audio_features, sync_dancers,
+                 genre_break, genre_pop, genre_lock, genre_waack, genre_krump,
+                 genre_house, genre_street_jazz, genre_ballet_jazz, 
+                 genre_la_hip_hop, genre_middle_hip_hop,
+                 transition_frames, chunks_per_beat, energy_sensitivity, seed, reference_pose=None):
+        
+        random.seed(seed)
+        np.random.seed(seed)
+        
+        base_path = library['_base_path']
+        source_fps = library['fps']  # 60
+        target_fps = audio_features['fps']  # likely 24
+        frame_count = audio_features['frame_count']
+        
+        # Build genre list from boolean flags
+        genre_map = {
+            'break': genre_break, 'pop': genre_pop, 'lock': genre_lock,
+            'waack': genre_waack, 'krump': genre_krump, 'house': genre_house,
+            'street_jazz': genre_street_jazz, 'ballet_jazz': genre_ballet_jazz,
+            'la_hip_hop': genre_la_hip_hop, 'middle_hip_hop': genre_middle_hip_hop
+        }
+        genre_list = [g for g, enabled in genre_map.items() if enabled and g in library['chunks']]
+        
+        if not genre_list:
+            genre_list = list(library['chunks'].keys())[:1]  # fallback to first genre
+        
+        # Determine number of characters from reference pose
+        char_count = 1
+        ref_data = []  # Store scale, floor_y, and center_x for each character
+        
+        # We need a sample AIST torso length to calculate scale
+        # Use average torso length from AIST data (roughly 50 units in their coordinate system)
+        AIST_AVG_TORSO = 50.0
+        
+        if reference_pose is not None:
+            ref_joints = reference_pose['joints'].numpy()
+            char_count = reference_pose.get('char_count', 1)
+            
+            for i in range(char_count):
+                start_idx = i * 18
+                end_idx = start_idx + 18
+                if end_idx <= len(ref_joints):
+                    char_joints = ref_joints[start_idx:end_idx]
+                    
+                    # Calculate reference skeleton height (neck to ankle)
+                    neck = char_joints[1]
+                    l_ankle = char_joints[13]
+                    r_ankle = char_joints[10]
+                    ankle_y = (l_ankle[1] + r_ankle[1]) / 2
+                    ref_height = abs(ankle_y - neck[1])
+                    
+                    # Calculate reference torso length for scale
+                    l_shoulder = char_joints[5]
+                    r_shoulder = char_joints[2]
+                    l_hip = char_joints[11]
+                    r_hip = char_joints[8]
+                    shoulder_center = (l_shoulder + r_shoulder) / 2
+                    hip_center = (l_hip + r_hip) / 2
+                    ref_torso = np.linalg.norm(shoulder_center - hip_center)
+                    
+                    # Calculate fixed scale: reference torso / AIST average torso
+                    if ref_torso > 0:
+                        fixed_scale = ref_torso / AIST_AVG_TORSO
+                    else:
+                        fixed_scale = 1.0
+                    
+                    # Floor is lowest Y in reference (highest value in screen coords)
+                    floor_y = np.max(char_joints[:, 1])
+                    
+                    # Center X position
+                    center_x = neck[0]
+                    
+                    # Depth from neck
+                    depth_z = neck[2]
+                    
+                    ref_data.append({
+                        'height': ref_height,
+                        'floor_y': floor_y,
+                        'center_x': center_x,
+                        'depth_z': depth_z,
+                        'scale': fixed_scale
+                    })
+                else:
+                    ref_data.append({
+                        'height': 200,
+                        'floor_y': 400,
+                        'center_x': 256,
+                        'depth_z': 800,
+                        'scale': 1.0
+                    })
+        else:
+            # Default if no reference
+            ref_data.append({
+                'height': 200,
+                'floor_y': 400,
+                'center_x': 256,
+                'depth_z': 800,
+                'scale': 1.0
+            })
+        
+        print(f"[AIST] Using genres: {genre_list}")
+        
+        # Get beat frames
+        beat_frames = beat_info.get('beat_frames', [])
+        if len(beat_frames) == 0:
+            # No beats - distribute evenly
+            beat_frames = list(range(0, frame_count, 30))
+        
+        # Get energy per frame (use bass as primary driver)
+        bass = audio_features['bass'].numpy()
+        
+        # Build chunk pools by energy level
+        chunk_pools = {'low': [], 'mid': [], 'high': []}
+        for genre in genre_list:
+            for level in ['low', 'mid', 'high']:
+                for chunk_info in library['chunks'][genre].get(level, []):
+                    chunk_pools[level].append(chunk_info)
+        
+        print(f"[AIST] Chunk pools - L:{len(chunk_pools['low'])} M:{len(chunk_pools['mid'])} H:{len(chunk_pools['high'])}")
+        
+        # Build lookup for consecutive chunks (same source, next start frame)
+        # Filename format: {source}_f{start:04d}.npy
+        chunk_sequences = {}  # source -> sorted list of chunk_infos by start frame
+        for genre in genre_list:
+            for level in ['low', 'mid', 'high']:
+                for chunk_info in library['chunks'][genre].get(level, []):
+                    # Parse filename to get source and start frame
+                    fname = os.path.basename(chunk_info['file'])
+                    # e.g., "d07_mJB0_ch01_f0336.npy"
+                    parts = fname.replace('.npy', '').rsplit('_f', 1)
+                    if len(parts) == 2:
+                        source = parts[0]
+                        try:
+                            start_frame = int(parts[1])
+                            if source not in chunk_sequences:
+                                chunk_sequences[source] = []
+                            chunk_sequences[source].append((start_frame, chunk_info))
+                        except ValueError:
+                            pass
+        
+        # Sort each source's chunks by start frame
+        for source in chunk_sequences:
+            chunk_sequences[source].sort(key=lambda x: x[0])
+        
+        def find_next_chunk(chunk_info):
+            """Find the next consecutive chunk from same source."""
+            fname = os.path.basename(chunk_info['file'])
+            parts = fname.replace('.npy', '').rsplit('_f', 1)
+            if len(parts) != 2:
+                return None
+            source = parts[0]
+            try:
+                current_start = int(parts[1])
+            except ValueError:
+                return None
+            
+            if source not in chunk_sequences:
+                return None
+            
+            # Find next chunk (start frame should be current + step, where step=24)
+            for start_frame, info in chunk_sequences[source]:
+                if start_frame > current_start:
+                    return info
+            return None
+        
+        # Shared state for synced dancers, or per-character state for independent
+        def make_state():
+            return {
+                'current_chunk': None,
+                'chunk_data': None,
+                'chunk_frame': 0,
+                'chunk_frames': 30,  # Will be set per-chunk from index
+                'prev_chunk_data': None,
+                'prev_last_pose': None,
+                'transition_frame': 0,
+                'in_transition': False,
+                'chunks_remaining': 0,  # How many more chunks in current chain
+            }
+        
+        if sync_dancers:
+            shared_state = make_state()
+        else:
+            char_states = [make_state() for _ in range(char_count)]
+        
+        # Generate output poses
+        output_poses = []
+        
+        # Time scaling: 60fps chunks -> target_fps output
+        time_scale = source_fps / target_fps  # e.g., 60/24 = 2.5
+        
+        def get_pose_from_state(state, frame_idx, is_beat, level, pool, base_path, time_scale, transition_frames, chunks_per_beat):
+            """Get interpolated pose from state, handling chunk transitions."""
+            
+            # Calculate max output frames for current chunk
+            chunk_frames = state['chunk_frames']
+            max_output_frames = int(chunk_frames / time_scale)
+            
+            # Check if we need to switch chunks (on beat, or no chunk, or finished chain)
+            need_new_chunk = (
+                state['chunk_data'] is None or
+                (is_beat and state['chunks_remaining'] <= 0)
+            )
+            
+            # Check if current chunk ended and we should chain to next
+            if state['chunk_data'] is not None and state['chunk_frame'] >= max_output_frames:
+                if state['chunks_remaining'] > 0:
+                    # Chain to next consecutive chunk
+                    next_chunk = find_next_chunk(state['current_chunk'])
+                    if next_chunk is not None:
+                        # Smooth transition - save last pose
+                        state['prev_last_pose'] = state['chunk_data'][-1].copy()
+                        state['in_transition'] = True
+                        state['transition_frame'] = 0
+                        
+                        state['current_chunk'] = next_chunk
+                        chunk_path = os.path.join(base_path, state['current_chunk']['file'])
+                        state['chunk_data'] = np.load(chunk_path)
+                        state['chunk_frames'] = next_chunk.get('frames', len(state['chunk_data']))
+                        state['chunk_frame'] = 0
+                        state['chunks_remaining'] -= 1
+                    else:
+                        # No consecutive chunk found - pick new random one with transition
+                        if pool:
+                            state['prev_last_pose'] = state['chunk_data'][-1].copy()
+                            state['in_transition'] = True
+                            state['transition_frame'] = 0
+                            
+                            new_chunk = random.choice(pool)
+                            state['current_chunk'] = new_chunk
+                            chunk_path = os.path.join(base_path, new_chunk['file'])
+                            state['chunk_data'] = np.load(chunk_path)
+                            state['chunk_frames'] = new_chunk.get('frames', len(state['chunk_data']))
+                            state['chunk_frame'] = 0
+                            state['chunks_remaining'] -= 1
+                        else:
+                            state['chunk_frame'] = max_output_frames - 1
+                            state['chunks_remaining'] = 0
+                else:
+                    # Hold last frame until next beat
+                    state['chunk_frame'] = max_output_frames - 1
+            
+            if need_new_chunk and pool:
+                # Save previous pose for blending
+                if state['chunk_data'] is not None:
+                    src_frame_idx = min(state['chunk_frame'], len(state['chunk_data']) - 1)
+                    state['prev_last_pose'] = state['chunk_data'][src_frame_idx].copy()
+                    state['in_transition'] = True
+                    state['transition_frame'] = 0
+                
+                # Load new chunk
+                new_chunk = random.choice(pool)
+                state['current_chunk'] = new_chunk
+                chunk_path = os.path.join(base_path, new_chunk['file'])
+                state['chunk_data'] = np.load(chunk_path)
+                state['chunk_frames'] = new_chunk.get('frames', len(state['chunk_data']))
+                state['chunk_frame'] = 0
+                state['chunks_remaining'] = chunks_per_beat - 1
+            
+            if state['chunk_data'] is None:
+                return np.zeros((18, 3), dtype=np.float32)
+            
+            # Sample from current chunk (using this chunk's frame count)
+            chunk_frames = state['chunk_frames']
+            src_frame = state['chunk_frame'] * time_scale
+            src_frame_low = int(src_frame)
+            src_frame_high = min(src_frame_low + 1, chunk_frames - 1)
+            t = src_frame - src_frame_low
+            
+            if src_frame_low < chunk_frames:
+                pose = (1 - t) * state['chunk_data'][src_frame_low] + t * state['chunk_data'][src_frame_high]
+            else:
+                pose = state['chunk_data'][-1].copy()
+            
+            # Blend from previous chunk if in transition
+            if state['in_transition'] and state['prev_last_pose'] is not None:
+                blend_t = state['transition_frame'] / transition_frames
+                # Smooth easing
+                blend_t = blend_t * blend_t * (3 - 2 * blend_t)
+                pose = (1 - blend_t) * state['prev_last_pose'] + blend_t * pose
+                
+                state['transition_frame'] += 1
+                if state['transition_frame'] >= transition_frames:
+                    state['in_transition'] = False
+                    state['prev_last_pose'] = None
+            
+            return pose
+        
+        for frame_idx in range(frame_count):
+            # Check if we hit a beat
+            is_beat = frame_idx in beat_frames
+            
+            # Get energy level for this frame
+            energy = bass[min(frame_idx, len(bass)-1)] * energy_sensitivity
+            if energy < 0.33:
+                level = 'low'
+            elif energy < 0.66:
+                level = 'mid'
+            else:
+                level = 'high'
+            
+            pool = chunk_pools[level]
+            
+            # Build frame with all characters
+            all_joints = []
+            
+            for char_idx in range(char_count):
+                if sync_dancers:
+                    state = shared_state
+                else:
+                    state = char_states[char_idx]
+                
+                # Get reference data for this character
+                ref = ref_data[char_idx] if char_idx < len(ref_data) else ref_data[0]
+                
+                pose = get_pose_from_state(
+                    state, frame_idx, is_beat, level, pool, 
+                    base_path, time_scale, transition_frames, chunks_per_beat
+                )
+                
+                pose = pose.copy()
+                
+                # Use fixed scale from reference pose
+                scale = ref['scale']
+                
+                # Get body center for positioning
+                l_shoulder = pose[5]
+                r_shoulder = pose[2]
+                l_hip = pose[11]
+                r_hip = pose[8]
+                shoulder_center = (l_shoulder + r_shoulder) / 2
+                hip_center = (l_hip + r_hip) / 2
+                
+                # Center and scale the pose (scale is fixed from reference)
+                pose_center_x = (shoulder_center[0] + hip_center[0]) / 2
+                pose_center_y = (shoulder_center[1] + hip_center[1]) / 2
+                
+                # Scale around center
+                pose[:, 0] = (pose[:, 0] - pose_center_x) * scale
+                pose[:, 1] = (pose[:, 1] - pose_center_y) * scale
+                pose[:, 2] = ref['depth_z']
+                
+                # Flip Y axis (AIST Y-up to renderer Y-down)
+                pose[:, 1] = -pose[:, 1]
+                
+                # Position: center X, anchor lowest point to floor
+                pose[:, 0] = pose[:, 0] + ref['center_x']
+                
+                # Find lowest point (highest Y value after flip)
+                pose_floor_y = np.max(pose[:, 1])
+                floor_offset = ref['floor_y'] - pose_floor_y
+                pose[:, 1] = pose[:, 1] + floor_offset
+                
+                all_joints.append(pose.astype(np.float32))
+            
+            # Advance frame counter (once for sync, per-char for independent)
+            # Don't reset to 0 here - chaining logic in get_pose_from_state handles that
+            if sync_dancers:
+                shared_state['chunk_frame'] += 1
+            else:
+                for state in char_states:
+                    state['chunk_frame'] += 1
+            
+            # Combine all characters into single array
+            frame_joints = np.concatenate(all_joints, axis=0)
+            output_poses.append(frame_joints)
+        
+        # Blend from reference pose over transition frames (for all characters)
+        if reference_pose is not None and len(output_poses) > 0:
+            ref_joints = reference_pose['joints'].numpy()
+            
+            blend_frames = min(transition_frames, len(output_poses))
+            for i in range(blend_frames):
+                t = i / blend_frames
+                # Smooth easing
+                t = t * t * (3 - 2 * t)
+                output_poses[i] = (1 - t) * ref_joints + t * output_poses[i]
+        
+        # Build limb_seq and colors for all characters
+        full_limb_seq = []
+        full_colors = []
+        for i in range(char_count):
+            offset = i * 18
+            for (s, e) in LIMB_SEQ:
+                full_limb_seq.append((s + offset, e + offset))
+            full_colors.extend(BONE_COLORS)
+        
+        return ({
+            "poses": output_poses,
+            "limb_seq": full_limb_seq,
+            "bone_colors": full_colors
+        },)
+
+
+class SCAILAISTChunkPreview:
+    """
+    Preview random chunks from the library for testing.
+    """
+    
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "library": ("AIST_LIBRARY", {"tooltip": "AIST chunk library"}),
+                "genre": ("STRING", {"default": "break", "tooltip": "Genre to preview"}),
+                "energy": (["low", "mid", "high"], {"default": "mid"}),
+                "chunk_index": ("INT", {"default": 0, "min": 0, "max": 10000}),
+            }
+        }
+    
+    RETURN_TYPES = ("SCAIL_POSE_SEQUENCE",)
+    RETURN_NAMES = ("pose_sequence",)
+    FUNCTION = "preview"
+    CATEGORY = "SCAIL-AudioReactive/AIST"
+    
+    def preview(self, library, genre, energy, chunk_index):
+        base_path = library['_base_path']
+        
+        if genre not in library['chunks']:
+            genre = list(library['chunks'].keys())[0]
+        
+        chunks = library['chunks'][genre].get(energy, [])
+        if not chunks:
+            raise ValueError(f"No {energy} chunks for {genre}")
+        
+        chunk_info = chunks[chunk_index % len(chunks)]
+        chunk_path = os.path.join(base_path, chunk_info['file'])
+        chunk_data = np.load(chunk_path)
+        
+        print(f"[AIST] Preview: {chunk_info['file']} (energy: {chunk_info['energy']:.2f})")
+        
+        # Convert to pose list
+        poses = [chunk_data[i].astype(np.float32) for i in range(len(chunk_data))]
+        
+        return ({
+            "poses": poses,
+            "limb_seq": LIMB_SEQ,
+            "bone_colors": BONE_COLORS
+        },)
+
+
+# ============================================================================
+# FULL SEQUENCE NODES
+# ============================================================================
+
+AIST_FULL_HF_URL = "https://huggingface.co/datasets/ckinpdx/aist_chunks/resolve/main/aist_npy.tar.gz"
+
+def get_aist_full_path():
+    """Get default path for full AIST sequences"""
+    comfy_path = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    return os.path.join(comfy_path, "models", "aist_full")
+
+def download_aist_full(destination, max_retries=3):
+    """Download and extract full AIST sequences from HuggingFace"""
+    os.makedirs(destination, exist_ok=True)
+    
+    tar_path = os.path.join(destination, "aist_npy.tar.gz")
+    
+    for attempt in range(max_retries):
+        print(f"[AIST Full] Downloading from HuggingFace (attempt {attempt + 1}/{max_retries})...")
+        print(f"[AIST Full] This is ~200MB, may take a few minutes...")
+        
+        try:
+            # Download with progress
+            def report_progress(block_num, block_size, total_size):
+                downloaded = block_num * block_size
+                percent = min(100, downloaded * 100 // total_size)
+                mb_down = downloaded / (1024 * 1024)
+                mb_total = total_size / (1024 * 1024)
+                print(f"\r[AIST Full] Downloading: {percent}% ({mb_down:.1f}/{mb_total:.1f} MB)", end="", flush=True)
+            
+            urllib.request.urlretrieve(AIST_FULL_HF_URL, tar_path, report_progress)
+            print()
+            
+            # Verify file size (should be ~200MB)
+            file_size = os.path.getsize(tar_path)
+            if file_size < 190 * 1024 * 1024:  # Less than 190MB = incomplete
+                print(f"[AIST Full] Download incomplete ({file_size / 1024 / 1024:.1f}MB), retrying...")
+                os.remove(tar_path)
+                continue
+            
+            print(f"[AIST Full] Download complete ({file_size / 1024 / 1024:.1f}MB)")
+            print(f"[AIST Full] Extracting...")
+            
+            with tarfile.open(tar_path, "r:gz") as tar:
+                tar.extractall(destination)
+            
+            os.remove(tar_path)
+            print(f"[AIST Full] Done! Library at: {destination}")
+            return True
+            
+        except Exception as e:
+            print(f"\n[AIST Full] Error: {e}")
+            if os.path.exists(tar_path):
+                os.remove(tar_path)
+            if attempt < max_retries - 1:
+                print(f"[AIST Full] Retrying...")
+            else:
+                raise RuntimeError(
+                    f"Failed to download AIST library after {max_retries} attempts. "
+                    f"Please download manually from {AIST_FULL_HF_URL} and extract to {destination}"
+                )
+
+
+# COCO 17 to OpenPose 18 conversion (full sequences are in COCO format)
+def coco_to_openpose(coco):
+    """Convert COCO 17 keypoints to OpenPose 18 format."""
+    single_frame = coco.ndim == 2
+    if single_frame:
+        coco = coco[np.newaxis, ...]
+    
+    frames = coco.shape[0]
+    openpose = np.zeros((frames, 18, 3), dtype=np.float32)
+    
+    mapping = {
+        0: 0, 1: 15, 2: 14, 3: 17, 4: 16, 5: 5, 6: 2,
+        7: 6, 8: 3, 9: 7, 10: 4, 11: 11, 12: 8,
+        13: 12, 14: 9, 15: 13, 16: 10,
+    }
+    
+    for coco_idx, op_idx in mapping.items():
+        openpose[:, op_idx, :] = coco[:, coco_idx, :]
+    
+    # Neck = midpoint of shoulders
+    openpose[:, 1, :] = (coco[:, 5, :] + coco[:, 6, :]) / 2
+    
+    if single_frame:
+        return openpose[0]
+    return openpose
+
+
+class SCAILAISTFullLoader:
+    """
+    Loads full AIST++ sequences. Auto-downloads from HuggingFace on first use.
+    """
+    
+    @classmethod
+    def INPUT_TYPES(cls):
+        default_path = get_aist_full_path()
+        return {
+            "required": {
+                "library_path": ("STRING", {
+                    "default": default_path,
+                    "tooltip": "Path to aist_full folder. Leave default to auto-download."
+                }),
+                "auto_download": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Automatically download from HuggingFace if not found"
+                }),
+            }
+        }
+    
+    RETURN_TYPES = ("AIST_FULL_LIBRARY",)
+    RETURN_NAMES = ("library",)
+    FUNCTION = "load"
+    CATEGORY = "SCAIL-AudioReactive/AIST"
+    
+    def load(self, library_path, auto_download):
+        # Check if any genre folder exists
+        genres = ["break", "pop", "lock", "waack", "krump", 
+                  "street_jazz", "ballet_jazz", "la_hip_hop", "house", "middle_hip_hop"]
+        
+        found_genres = [g for g in genres if os.path.exists(os.path.join(library_path, g))]
+        
+        if not found_genres:
+            if auto_download:
+                print(f"[AIST Full] Library not found at {library_path}")
+                download_aist_full(library_path)
+                found_genres = [g for g in genres if os.path.exists(os.path.join(library_path, g))]
+            else:
+                raise FileNotFoundError(f"No genre folders found in {library_path}")
+        
+        # Build index of sequences
+        sequences = {}
+        total = 0
+        for genre in found_genres:
+            genre_path = os.path.join(library_path, genre)
+            files = [f for f in os.listdir(genre_path) if f.endswith('.npy')]
+            sequences[genre] = files
+            total += len(files)
+        
+        print(f"[AIST Full] Loaded: {len(found_genres)} genres, {total} sequences")
+        
+        return ({
+            '_base_path': library_path,
+            'sequences': sequences,
+            'fps': 60
+        },)
+
+
+class SCAILAISTFullSequence:
+    """
+    Plays full AIST++ dance sequences, time-scaled to target fps.
+    """
+    
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "library": ("AIST_FULL_LIBRARY", {"tooltip": "Full sequence library from loader"}),
+                "audio_features": ("SCAIL_AUDIO_FEATURES", {"tooltip": "Audio features for frame count/fps"}),
+                "genre": (["break", "pop", "lock", "waack", "krump", "house", 
+                          "street_jazz", "ballet_jazz", "la_hip_hop", "middle_hip_hop"], 
+                         {"default": "break", "tooltip": "Dance genre"}),
+                "transition_frames": ("INT", {
+                    "default": 12, "min": 1, "max": 60,
+                    "tooltip": "Frames to blend from reference pose to dance"
+                }),
+                "start_beat": ("INT", {
+                    "default": 0, "min": 0, "max": 100,
+                    "tooltip": "Which beat in the source to start from (0=beginning)"
+                }),
+                "seed": ("INT", {
+                    "default": 0, "min": 0, "max": 0xffffffff,
+                    "tooltip": "Random seed for sequence selection"
+                }),
+            },
+            "optional": {
+                "reference_pose": ("SCAIL_POSE", {
+                    "tooltip": "Starting pose from DWPose to match scale/position"
+                }),
+                "beat_info": ("SCAIL_BEAT_INFO", {
+                    "tooltip": "Optional beat info to start on a beat-aligned frame"
+                }),
+            }
+        }
+    
+    RETURN_TYPES = ("SCAIL_POSE_SEQUENCE",)
+    RETURN_NAMES = ("pose_sequence",)
+    FUNCTION = "generate"
+    CATEGORY = "SCAIL-AudioReactive/AIST"
+    
+    def generate(self, library, audio_features, genre, transition_frames, start_beat, seed, 
+                 reference_pose=None, beat_info=None):
+        
+        random.seed(seed)
+        np.random.seed(seed)
+        
+        base_path = library['_base_path']
+        source_fps = library['fps']  # 60
+        target_fps = audio_features['fps']
+        frame_count = audio_features['frame_count']
+        
+        # Check genre exists
+        if genre not in library['sequences'] or not library['sequences'][genre]:
+            # Fallback to first available genre
+            genre = list(library['sequences'].keys())[0]
+            print(f"[AIST Full] Genre not found, using {genre}")
+        
+        # Pick a random sequence from genre
+        fname = random.choice(library['sequences'][genre])
+        seq_path = os.path.join(base_path, genre, fname)
+        
+        # Load and convert to OpenPose format
+        coco_data = np.load(seq_path)
+        sequence = coco_to_openpose(coco_data)
+        
+        print(f"[AIST Full] Playing: {genre}/{fname} ({len(sequence)} frames @ {source_fps}fps)")
+        
+        # Determine start frame
+        start_frame = 0
+        if beat_info is not None and start_beat > 0:
+            # Find beat-aligned start frame in source
+            # Estimate source beats assuming similar tempo
+            beat_frames = beat_info.get('beat_frames', [])
+            if len(beat_frames) > 1:
+                avg_beat_interval = np.mean(np.diff(beat_frames))
+                # Scale to source fps
+                source_beat_interval = avg_beat_interval * (source_fps / target_fps)
+                start_frame = int(start_beat * source_beat_interval)
+                start_frame = min(start_frame, len(sequence) - 1)
+        
+        # Get reference data
+        char_count = 1
+        ref_data = []
+        
+        if reference_pose is not None:
+            ref_joints = reference_pose['joints'].numpy()
+            char_count = reference_pose.get('char_count', 1)
+            
+            for i in range(char_count):
+                start_idx = i * 18
+                end_idx = start_idx + 18
+                if end_idx <= len(ref_joints):
+                    char_joints = ref_joints[start_idx:end_idx]
+                    
+                    neck = char_joints[1]
+                    l_ankle = char_joints[13]
+                    r_ankle = char_joints[10]
+                    ankle_y = (l_ankle[1] + r_ankle[1]) / 2
+                    ref_height = abs(ankle_y - neck[1])
+                    floor_y = np.max(char_joints[:, 1])
+                    center_x = neck[0]
+                    depth_z = neck[2]
+                    
+                    ref_data.append({
+                        'height': ref_height,
+                        'floor_y': floor_y,
+                        'center_x': center_x,
+                        'depth_z': depth_z
+                    })
+                else:
+                    ref_data.append({'height': 200, 'floor_y': 400, 'center_x': 256, 'depth_z': 800})
+        else:
+            ref_data.append({'height': 200, 'floor_y': 400, 'center_x': 256, 'depth_z': 800})
+        
+        # Calculate scale from first frame
+        first_frame = sequence[start_frame]
+        l_shoulder = first_frame[5]
+        r_shoulder = first_frame[2]
+        l_hip = first_frame[11]
+        r_hip = first_frame[8]
+        shoulder_center = (l_shoulder + r_shoulder) / 2
+        hip_center = (l_hip + r_hip) / 2
+        torso_length = np.linalg.norm(shoulder_center - hip_center)
+        
+        ref = ref_data[0]
+        ref_torso = ref['height'] * 0.4
+        scale = ref_torso / torso_length if torso_length > 0 else 1.0
+        
+        # Time scaling
+        time_scale = source_fps / target_fps
+        
+        # Generate output poses
+        output_poses = []
+        
+        for frame_idx in range(frame_count):
+            # Map to source frame
+            src_frame_float = start_frame + (frame_idx * time_scale)
+            src_frame_low = int(src_frame_float)
+            src_frame_high = min(src_frame_low + 1, len(sequence) - 1)
+            t = src_frame_float - src_frame_low
+            
+            # Handle end of sequence - hold last frame
+            if src_frame_low >= len(sequence):
+                src_frame_low = len(sequence) - 1
+                src_frame_high = src_frame_low
+                t = 0
+            
+            # Interpolate
+            pose = (1 - t) * sequence[src_frame_low] + t * sequence[src_frame_high]
+            
+            # Build output for all characters
+            all_joints = []
+            
+            for char_idx in range(char_count):
+                char_pose = pose.copy()
+                char_ref = ref_data[char_idx] if char_idx < len(ref_data) else ref_data[0]
+                
+                # Get body center
+                l_shoulder = char_pose[5]
+                r_shoulder = char_pose[2]
+                l_hip = char_pose[11]
+                r_hip = char_pose[8]
+                shoulder_center = (l_shoulder + r_shoulder) / 2
+                hip_center = (l_hip + r_hip) / 2
+                
+                # Scale around center
+                pose_center_x = (shoulder_center[0] + hip_center[0]) / 2
+                pose_center_y = (shoulder_center[1] + hip_center[1]) / 2
+                
+                char_pose[:, 0] = (char_pose[:, 0] - pose_center_x) * scale
+                char_pose[:, 1] = (char_pose[:, 1] - pose_center_y) * scale
+                char_pose[:, 2] = char_ref['depth_z']
+                
+                # Flip Y
+                char_pose[:, 1] = -char_pose[:, 1]
+                
+                # Position
+                char_pose[:, 0] = char_pose[:, 0] + char_ref['center_x']
+                
+                # Floor anchor
+                pose_floor_y = np.max(char_pose[:, 1])
+                floor_offset = char_ref['floor_y'] - pose_floor_y
+                char_pose[:, 1] = char_pose[:, 1] + floor_offset
+                
+                all_joints.append(char_pose.astype(np.float32))
+            
+            frame_joints = np.concatenate(all_joints, axis=0)
+            output_poses.append(frame_joints)
+        
+        # Blend from reference pose over transition frames
+        if reference_pose is not None and len(output_poses) > 0:
+            ref_joints = reference_pose['joints'].numpy()
+            
+            blend_frames = min(transition_frames, len(output_poses))
+            for i in range(blend_frames):
+                t = i / blend_frames
+                # Smooth easing
+                t = t * t * (3 - 2 * t)
+                output_poses[i] = (1 - t) * ref_joints + t * output_poses[i]
+        
+        # Build limb_seq and colors for all characters
+        full_limb_seq = []
+        full_colors = []
+        for i in range(char_count):
+            offset = i * 18
+            for (s, e) in LIMB_SEQ:
+                full_limb_seq.append((s + offset, e + offset))
+            full_colors.extend(BONE_COLORS)
+        
+        return ({
+            "poses": output_poses,
+            "limb_seq": full_limb_seq,
+            "bone_colors": full_colors
+        },)
+
+
+
+
 
 # ============================================================================
 # MAPPINGS
@@ -1221,6 +2199,11 @@ NODE_CLASS_MAPPINGS = {
     "SCAILPoseRenderer": SCAILPoseRenderer,
     "SCAILPoseFromDWPose": SCAILPoseFromDWPose,
     "SCAILAlignPoseToReference": SCAILAlignPoseToReference,
+    "SCAILAISTLibraryLoader": SCAILAISTLibraryLoader,
+    "SCAILAISTBeatDance": SCAILAISTBeatDance,
+    "SCAILAISTChunkPreview": SCAILAISTChunkPreview,
+    "SCAILAISTFullLoader": SCAILAISTFullLoader,
+    "SCAILAISTFullSequence": SCAILAISTFullSequence,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -1231,4 +2214,9 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "SCAILPoseRenderer": "SCAIL Pose Render",
     "SCAILPoseFromDWPose": "SCAIL Pose from DWPose",
     "SCAILAlignPoseToReference": "SCAIL Align to Reference",
+    "SCAILAISTLibraryLoader": "SCAIL AIST Library",
+    "SCAILAISTBeatDance": "SCAIL AIST Beat Dance", 
+    "SCAILAISTChunkPreview": "SCAIL AIST Preview",
+    "SCAILAISTFullLoader": "SCAIL AIST Full Library",
+    "SCAILAISTFullSequence": "SCAIL AIST Full Sequence",
 }
