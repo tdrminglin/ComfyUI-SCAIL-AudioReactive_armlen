@@ -1219,6 +1219,7 @@ class SCAILAlignPoseToReference:
 # AIST++ CHUNK LIBRARY NODES
 # ============================================================================
 
+
 # HuggingFace dataset URL
 AIST_HF_URL = "https://huggingface.co/datasets/ckinpdx/aist_chunks/resolve/main/aist_chunks_v2.tar.gz"
 
@@ -1407,41 +1408,66 @@ class SCAILAISTBeatDance:
         char_count = 1
         ref_data = []  # Store scale, floor_y, and center_x for each character
         
-        # We need a sample AIST torso length to calculate scale
-        # Use average torso length from AIST data (roughly 50 units in their coordinate system)
-        AIST_AVG_TORSO = 50.0
+        # We need a sample AIST full height to calculate scale
+        # AIST full body Y-span is ~136 units (from lowest foot to head)
+        AIST_AVG_HEIGHT = 136.0
+        
+        def calc_leg_angle(hip, knee, ankle):
+            """Calculate angle at knee - 180° = straight leg"""
+            v1 = hip - knee
+            v2 = ankle - knee
+            cos_angle = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2) + 1e-8)
+            return np.degrees(np.arccos(np.clip(cos_angle, -1, 1)))
         
         if reference_pose is not None:
             ref_joints = reference_pose['joints'].numpy()
             char_count = reference_pose.get('char_count', 1)
             
+            # Build ref_data with per-character scale based on full height
             for i in range(char_count):
                 start_idx = i * 18
                 end_idx = start_idx + 18
                 if end_idx <= len(ref_joints):
                     char_joints = ref_joints[start_idx:end_idx]
                     
-                    # Calculate reference skeleton height (neck to ankle)
-                    neck = char_joints[1]
+                    # Get leg joints
+                    l_hip = char_joints[11]
+                    l_knee = char_joints[12]
                     l_ankle = char_joints[13]
+                    r_hip = char_joints[8]
+                    r_knee = char_joints[9]
                     r_ankle = char_joints[10]
+                    
+                    # Calculate leg angles
+                    l_angle = calc_leg_angle(l_hip, l_knee, l_ankle)
+                    r_angle = calc_leg_angle(r_hip, r_knee, r_ankle)
+                    
+                    # Only use straight legs (>160°), average them
+                    straight_legs = []
+                    if l_angle > 160:
+                        straight_legs.append(l_ankle[1])
+                    if r_angle > 160:
+                        straight_legs.append(r_ankle[1])
+                    
+                    if straight_legs:
+                        foot_y = sum(straight_legs) / len(straight_legs)
+                    else:
+                        # Fallback to lowest foot
+                        foot_y = max(l_ankle[1], r_ankle[1])
+                    
+                    # Full height: nose to foot
+                    head_y = char_joints[0][1]  # nose
+                    full_height = abs(foot_y - head_y)
+                    
+                    # Per-character scale
+                    char_scale = full_height / AIST_AVG_HEIGHT if full_height > 0 else 1.0
+                    
+                    print(f"[AIST] Char {i}: l_angle={l_angle:.0f}° r_angle={r_angle:.0f}° height={full_height:.1f} scale={char_scale:.2f}")
+                    
+                    # Also store ref_height for other uses
+                    neck = char_joints[1]
                     ankle_y = (l_ankle[1] + r_ankle[1]) / 2
                     ref_height = abs(ankle_y - neck[1])
-                    
-                    # Calculate reference torso length for scale
-                    l_shoulder = char_joints[5]
-                    r_shoulder = char_joints[2]
-                    l_hip = char_joints[11]
-                    r_hip = char_joints[8]
-                    shoulder_center = (l_shoulder + r_shoulder) / 2
-                    hip_center = (l_hip + r_hip) / 2
-                    ref_torso = np.linalg.norm(shoulder_center - hip_center)
-                    
-                    # Calculate fixed scale: reference torso / AIST average torso
-                    if ref_torso > 0:
-                        fixed_scale = ref_torso / AIST_AVG_TORSO
-                    else:
-                        fixed_scale = 1.0
                     
                     # Floor is lowest Y in reference (highest value in screen coords)
                     floor_y = np.max(char_joints[:, 1])
@@ -1457,7 +1483,7 @@ class SCAILAISTBeatDance:
                         'floor_y': floor_y,
                         'center_x': center_x,
                         'depth_z': depth_z,
-                        'scale': fixed_scale
+                        'scale': char_scale
                     })
                 else:
                     ref_data.append({
@@ -2182,9 +2208,6 @@ class SCAILAISTFullSequence:
             "limb_seq": full_limb_seq,
             "bone_colors": full_colors
         },)
-
-
-
 
 
 # ============================================================================
