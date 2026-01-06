@@ -557,9 +557,19 @@ class MotionDynamics:
                 # Find the parent index within the same character chunk
                 char_offset = (j // 18) * 18
                 parent_idx = parent_base + char_offset
-                
+                dist = np.linalg.norm(start_pose[j] - start_pose[parent_idx])
+                torso_ref = np.linalg.norm(start_pose[1] - (start_pose[8] + start_pose[11]) / 2)
+                if j % 18 == 0: # 索引 0 是鼻子(Nose)，它的父级是 1(Neck)
+                    # 正常人类脖子到头顶/鼻子的距离通常只有躯干长度的 20% - 25% 左右
+                    # 如果超过这个比例，强行缩短
+                    dist = min(dist, torso_ref * 0.22) 
+                if j % 18 == 0: # 索引 0 是鼻子(Nose)，它的父级是 1(Neck)
+                    # 正常人类脖子到头顶/鼻子的距离通常只有躯干长度的 20% - 25% 左右
+                    # 如果超过这个比例，强行缩短
+                    dist = min(dist, torso_ref * 0.22) 
                 # Store distance
-                self.bone_lengths[j] = np.linalg.norm(start_pose[j] - start_pose[parent_idx])
+                self.bone_lengths[j] = dist
+                #self.bone_lengths[j] = np.linalg.norm(start_pose[j] - start_pose[parent_idx])
 
     def step_towards(self, target_pose, urgency=1.0):
         # Physics update
