@@ -563,7 +563,7 @@ class MotionDynamics:
                     # 正常人类脖子到头顶/鼻子的距离通常只有躯干长度的 20% - 25% 左右
                     # 如果超过这个比例，强行缩短
                     dist = min(dist, torso_ref * 0.18) 
-                 elif j % 18 in [3, 4, 6, 7]: 
+                elif j % 18 in [3, 4, 6, 7]: 
                     dist = min(dist, torso_ref * 0.3)
                 # Store distance
                 self.bone_lengths[j] = dist
